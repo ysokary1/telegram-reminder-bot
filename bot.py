@@ -1,141 +1,476 @@
 import os
 import json
 import logging
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime, timedelta, time
+from typing import Optional, List, Dict
 import sqlite3
-import asyncio
+import re
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 import httpx
 
-# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# Conversation states
+EDIT_FIELD, SNOOZE_TIME = range(2)
 
-class ReminderDatabase:
-    """Database for storing reminders"""
+
+class Database:
+    """Comprehensive database for all PA features"""
     
-    def __init__(self, db_path="reminders.db"):
+    def __init__(self, db_path="assistant.db"):
         self.db_path = db_path
         self.init_db()
     
     def init_db(self):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        
+        # Tasks table
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS reminders (
+            CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 chat_id INTEGER NOT NULL,
-                message TEXT NOT NULL,
-                reminder_type TEXT NOT NULL,
-                schedule_info TEXT NOT NULL,
-                job_id TEXT UNIQUE,
+                title TEXT NOT NULL,
+                description TEXT,
+                priority TEXT DEFAULT 'medium',
+                project TEXT DEFAULT 'inbox',
+                labels TEXT,
+                due_date TEXT,
+                recurrence TEXT,
+                parent_task_id INTEGER,
+                completed INTEGER DEFAULT 0,
+                completed_at TEXT,
                 created_at TEXT NOT NULL,
-                is_active INTEGER DEFAULT 1
+                updated_at TEXT,
+                job_id TEXT
             )
         ''')
+        
+        # Notes table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                title TEXT,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        ''')
+        
+        # Habits table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS habits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                goal_frequency TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        ''')
+        
+        # Habit completions
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS habit_completions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                habit_id INTEGER NOT NULL,
+                completed_date TEXT NOT NULL,
+                FOREIGN KEY (habit_id) REFERENCES habits (id)
+            )
+        ''')
+        
+        # User preferences
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id INTEGER PRIMARY KEY,
+                morning_briefing_time TEXT,
+                evening_briefing_time TEXT,
+                timezone TEXT DEFAULT 'UTC'
+            )
+        ''')
+        
         conn.commit()
         conn.close()
     
-    def add_reminder(self, user_id: int, chat_id: int, message: str, 
-                     reminder_type: str, schedule_info: dict, job_id: str):
+    def add_task(self, user_id: int, chat_id: int, title: str, description: str = None,
+                 priority: str = 'medium', project: str = 'inbox', labels: str = None,
+                 due_date: str = None, recurrence: str = None, parent_task_id: int = None,
+                 job_id: str = None) -> int:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         cursor.execute('''
-            INSERT INTO reminders 
-            (user_id, chat_id, message, reminder_type, schedule_info, job_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            user_id,
-            chat_id,
-            message,
-            reminder_type,
-            json.dumps(schedule_info),
-            job_id,
-            datetime.now().isoformat()
-        ))
+            INSERT INTO tasks (user_id, chat_id, title, description, priority, project, 
+                             labels, due_date, recurrence, parent_task_id, created_at, job_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, chat_id, title, description, priority, project, labels, due_date, 
+              recurrence, parent_task_id, datetime.now().isoformat(), job_id))
         
+        task_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return task_id
+    
+    def update_task(self, task_id: int, **kwargs):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            updates.append(f"{key} = ?")
+            values.append(value)
+        
+        values.append(datetime.now().isoformat())
+        values.append(task_id)
+        
+        query = f"UPDATE tasks SET {', '.join(updates)}, updated_at = ? WHERE id = ?"
+        cursor.execute(query, values)
         conn.commit()
         conn.close()
     
-    def get_active_reminders(self, user_id: int):
+    def get_task(self, task_id: int) -> Optional[Dict]:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT id, message, reminder_type, schedule_info, created_at
-            FROM reminders
-            WHERE user_id = ? AND is_active = 1
-            ORDER BY created_at DESC
-        ''', (user_id,))
-        results = cursor.fetchall()
+        cursor.execute('SELECT * FROM tasks WHERE id = ?', (task_id,))
+        row = cursor.fetchone()
+        
+        if row:
+            columns = [description[0] for description in cursor.description]
+            result = dict(zip(columns, row))
+        else:
+            result = None
+        
+        conn.close()
+        return result
+    
+    def get_tasks(self, user_id: int, completed: bool = False, 
+                  project: str = None, priority: str = None,
+                  parent_task_id: int = None) -> List[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        query = 'SELECT * FROM tasks WHERE user_id = ? AND completed = ?'
+        params = [user_id, 1 if completed else 0]
+        
+        if project:
+            query += ' AND project = ?'
+            params.append(project)
+        
+        if priority:
+            query += ' AND priority = ?'
+            params.append(priority)
+        
+        if parent_task_id is not None:
+            query += ' AND parent_task_id = ?'
+            params.append(parent_task_id)
+        elif parent_task_id is None:
+            query += ' AND parent_task_id IS NULL'
+        
+        query += ' ORDER BY due_date ASC, priority DESC, created_at DESC'
+        
+        cursor.execute(query, params)
+        columns = [description[0] for description in cursor.description]
+        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        
         conn.close()
         return results
     
-    def deactivate_reminder(self, job_id: str):
+    def get_tasks_by_date(self, user_id: int, start_date: str, end_date: str) -> List[Dict]:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute('UPDATE reminders SET is_active = 0 WHERE job_id = ?', (job_id,))
+        
+        cursor.execute('''
+            SELECT * FROM tasks 
+            WHERE user_id = ? AND completed = 0 
+            AND due_date >= ? AND due_date <= ?
+            ORDER BY due_date ASC, priority DESC
+        ''', (user_id, start_date, end_date))
+        
+        columns = [description[0] for description in cursor.description]
+        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        
+        conn.close()
+        return results
+    
+    def complete_task(self, task_id: int):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE tasks SET completed = 1, completed_at = ? WHERE id = ?
+        ''', (datetime.now().isoformat(), task_id))
         conn.commit()
         conn.close()
+    
+    def delete_task(self, task_id: int):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM tasks WHERE id = ? OR parent_task_id = ?', (task_id, task_id))
+        conn.commit()
+        conn.close()
+    
+    def search_tasks(self, user_id: int, query: str) -> List[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT * FROM tasks 
+            WHERE user_id = ? AND completed = 0 
+            AND (title LIKE ? OR description LIKE ? OR labels LIKE ?)
+            ORDER BY due_date ASC, priority DESC
+        ''', (user_id, f'%{query}%', f'%{query}%', f'%{query}%'))
+        
+        columns = [description[0] for description in cursor.description]
+        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        
+        conn.close()
+        return results
+    
+    def get_subtasks(self, parent_id: int) -> List[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM tasks WHERE parent_task_id = ?', (parent_id,))
+        columns = [description[0] for description in cursor.description]
+        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        
+        conn.close()
+        return results
+    
+    # Notes
+    def add_note(self, user_id: int, title: str, content: str):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO notes (user_id, title, content, created_at)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, title, content, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+    
+    def get_notes(self, user_id: int) -> List[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM notes WHERE user_id = ? ORDER BY created_at DESC', (user_id,))
+        columns = [description[0] for description in cursor.description]
+        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        conn.close()
+        return results
+    
+    # Habits
+    def add_habit(self, user_id: int, name: str, goal_frequency: str) -> int:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO habits (user_id, name, goal_frequency, created_at)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, name, goal_frequency, datetime.now().isoformat()))
+        habit_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return habit_id
+    
+    def get_habits(self, user_id: int) -> List[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM habits WHERE user_id = ?', (user_id,))
+        columns = [description[0] for description in cursor.description]
+        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        conn.close()
+        return results
+    
+    def mark_habit_complete(self, habit_id: int, date: str = None):
+        if not date:
+            date = datetime.now().date().isoformat()
+        
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Check if already marked
+        cursor.execute('SELECT id FROM habit_completions WHERE habit_id = ? AND completed_date = ?',
+                      (habit_id, date))
+        if cursor.fetchone():
+            conn.close()
+            return False
+        
+        cursor.execute('INSERT INTO habit_completions (habit_id, completed_date) VALUES (?, ?)',
+                      (habit_id, date))
+        conn.commit()
+        conn.close()
+        return True
+    
+    def get_habit_streak(self, habit_id: int) -> int:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT completed_date FROM habit_completions 
+            WHERE habit_id = ? 
+            ORDER BY completed_date DESC
+        ''', (habit_id,))
+        
+        dates = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        
+        if not dates:
+            return 0
+        
+        streak = 0
+        current_date = datetime.now().date()
+        
+        for date_str in dates:
+            date = datetime.fromisoformat(date_str).date()
+            if date == current_date - timedelta(days=streak):
+                streak += 1
+            else:
+                break
+        
+        return streak
+    
+    def get_habit_completions(self, habit_id: int, days: int = 30) -> List[str]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        start_date = (datetime.now() - timedelta(days=days)).date().isoformat()
+        cursor.execute('''
+            SELECT completed_date FROM habit_completions 
+            WHERE habit_id = ? AND completed_date >= ?
+            ORDER BY completed_date DESC
+        ''', (habit_id, start_date))
+        
+        results = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return results
+    
+    # User preferences
+    def set_briefing_times(self, user_id: int, morning: str = None, evening: str = None):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT user_id FROM user_preferences WHERE user_id = ?', (user_id,))
+        exists = cursor.fetchone()
+        
+        if exists:
+            updates = []
+            params = []
+            if morning:
+                updates.append('morning_briefing_time = ?')
+                params.append(morning)
+            if evening:
+                updates.append('evening_briefing_time = ?')
+                params.append(evening)
+            params.append(user_id)
+            
+            cursor.execute(f'UPDATE user_preferences SET {", ".join(updates)} WHERE user_id = ?', params)
+        else:
+            cursor.execute('''
+                INSERT INTO user_preferences (user_id, morning_briefing_time, evening_briefing_time)
+                VALUES (?, ?, ?)
+            ''', (user_id, morning, evening))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_user_preferences(self, user_id: int) -> Optional[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM user_preferences WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        
+        if row:
+            columns = [description[0] for description in cursor.description]
+            result = dict(zip(columns, row))
+        else:
+            result = None
+        
+        conn.close()
+        return result
+    
+    # Stats
+    def get_stats(self, user_id: int, days: int = 7) -> Dict:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        start_date = (datetime.now() - timedelta(days=days)).date().isoformat()
+        
+        # Tasks completed
+        cursor.execute('''
+            SELECT COUNT(*) FROM tasks 
+            WHERE user_id = ? AND completed = 1 AND completed_at >= ?
+        ''', (user_id, start_date))
+        completed = cursor.fetchone()[0]
+        
+        # Tasks created
+        cursor.execute('''
+            SELECT COUNT(*) FROM tasks 
+            WHERE user_id = ? AND created_at >= ?
+        ''', (user_id, start_date))
+        created = cursor.fetchone()[0]
+        
+        # Active tasks
+        cursor.execute('SELECT COUNT(*) FROM tasks WHERE user_id = ? AND completed = 0', (user_id,))
+        active = cursor.fetchone()[0]
+        
+        # Overdue tasks
+        cursor.execute('''
+            SELECT COUNT(*) FROM tasks 
+            WHERE user_id = ? AND completed = 0 AND due_date < ?
+        ''', (user_id, datetime.now().isoformat()))
+        overdue = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        return {
+            'completed': completed,
+            'created': created,
+            'active': active,
+            'overdue': overdue,
+            'completion_rate': round(completed / created * 100, 1) if created > 0 else 0
+        }
 
 
-class GroqParser:
-    """Uses Groq AI to parse natural language reminders"""
+class AIParser:
+    """AI for complex natural language parsing"""
     
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://api.groq.com/openai/v1/chat/completions"
     
-    async def parse_reminder(self, text: str) -> Optional[dict]:
-        """Use Groq to parse reminder text into structured format"""
-        
-        system_prompt = """You are a reminder parsing assistant. Extract reminder information from natural language and return ONLY a valid JSON object.
+    async def parse_task(self, text: str) -> Optional[Dict]:
+        system_prompt = """Extract task information from natural language. Return ONLY valid JSON.
 
-Current date and time: {current_time}
+Current date: {current_date}
 
-Parse the user's message and return a JSON object with these fields:
-- "message": The thing to remind about (string)
-- "type": One of: "one_time", "daily", "weekly", "custom_interval", "specific_days"
-- "start_datetime": ISO 8601 datetime when reminders should start (string)
-- "end_datetime": ISO 8601 datetime when reminders should end, or null (string or null)
-- "days_of_week": For weekly reminders, array of day numbers [0=Monday, 6=Sunday], or null
-- "interval_days": For custom intervals (like "every 3 days"), number of days, or null
-- "time_of_day": Time in HH:MM format (24-hour), or null for one-time reminders
+Extract:
+- "title": Main task (string)
+- "description": Additional details or null
+- "priority": "high", "medium", or "low"
+- "project": Category like "work", "personal", "health", or null
+- "labels": Comma-separated tags or null
+- "due_date": ISO datetime or null
+- "recurrence": "daily", "weekly", "monthly" or null
 
 Examples:
 
-Input: "remind me to call Steve in 30 minutes"
-Output: {{"message": "call Steve", "type": "one_time", "start_datetime": "2025-10-01T19:00:00", "end_datetime": null, "days_of_week": null, "interval_days": null, "time_of_day": null}}
+"call Steve tomorrow at 3pm #urgent #work"
+{{"title": "call Steve", "description": null, "priority": "high", "project": "work", "labels": "urgent,work", "due_date": "2025-10-02T15:00:00", "recurrence": null}}
 
-Input: "every day for 2 weeks remind me to exercise"
-Output: {{"message": "exercise", "type": "daily", "start_datetime": "2025-10-02T09:00:00", "end_datetime": "2025-10-16T09:00:00", "days_of_week": null, "interval_days": null, "time_of_day": "09:00"}}
+"high priority: finish report by Friday"
+{{"title": "finish report", "description": null, "priority": "high", "project": "work", "due_date": "2025-10-03", "recurrence": null}}
 
-Input: "every Thursday at 3pm remind me about team meeting"
-Output: {{"message": "team meeting", "type": "weekly", "start_datetime": "2025-10-03T15:00:00", "end_datetime": null, "days_of_week": [3], "interval_days": null, "time_of_day": "15:00"}}
-
-Input: "every 3 days remind me to water plants"
-Output: {{"message": "water plants", "type": "custom_interval", "start_datetime": "2025-10-01T09:00:00", "end_datetime": null, "days_of_week": null, "interval_days": 3, "time_of_day": "09:00"}}
-
-Input: "starting next Monday, remind me daily to take vitamins"
-Output: {{"message": "take vitamins", "type": "daily", "start_datetime": "2025-10-07T09:00:00", "end_datetime": null, "days_of_week": null, "interval_days": null, "time_of_day": "09:00"}}
-
-Return ONLY the JSON object, no other text.""".format(
-            current_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        )
+Return ONLY JSON.""".format(current_date=datetime.now().strftime("%Y-%m-%d %H:%M"))
         
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.post(
                     self.base_url,
                     headers={
@@ -149,259 +484,742 @@ Return ONLY the JSON object, no other text.""".format(
                             {"role": "user", "content": text}
                         ],
                         "temperature": 0.1,
-                        "max_tokens": 500
+                        "max_tokens": 300
                     }
                 )
                 
                 if response.status_code != 200:
-                    logger.error(f"Groq API error: {response.status_code} - {response.text}")
                     return None
                 
-                result = response.json()
-                content = result['choices'][0]['message']['content'].strip()
+                content = response.json()['choices'][0]['message']['content'].strip()
                 
-                # Remove markdown code blocks if present
                 if content.startswith('```'):
                     content = content.split('```')[1]
                     if content.startswith('json'):
                         content = content[4:]
                     content = content.strip()
                 
-                parsed = json.loads(content)
-                return parsed
+                return json.loads(content)
                 
         except Exception as e:
-            logger.error(f"Error calling Groq API: {e}")
+            logger.error(f"AI error: {e}")
             return None
 
 
-class TelegramReminderBot:
-    """Main bot class"""
+class PersonalAssistantBot:
+    """Full-featured Personal Assistant Bot"""
     
     def __init__(self, telegram_token: str, groq_api_key: str):
-        self.telegram_token = telegram_token
         self.app = Application.builder().token(telegram_token).build()
         self.scheduler = AsyncIOScheduler()
-        self.db = ReminderDatabase()
-        self.parser = GroqParser(groq_api_key)
+        self.db = Database()
+        self.ai = AIParser(groq_api_key)
         
-        # Add handlers
+        # Conversation handler for editing
+        edit_handler = ConversationHandler(
+            entry_points=[CommandHandler('edit', self.edit_task_start)],
+            states={
+                EDIT_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.edit_task_field)]
+            },
+            fallbacks=[CommandHandler('cancel', self.cancel)]
+        )
+        
+        # Command handlers
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("help", self.help_command))
-        self.app.add_handler(CommandHandler("list", self.list_reminders))
+        self.app.add_handler(CommandHandler("add", self.add_task_command))
+        self.app.add_handler(CommandHandler("today", self.today_command))
+        self.app.add_handler(CommandHandler("tomorrow", self.tomorrow_command))
+        self.app.add_handler(CommandHandler("week", self.week_command))
+        self.app.add_handler(CommandHandler("list", self.list_command))
+        self.app.add_handler(CommandHandler("projects", self.projects_command))
+        self.app.add_handler(CommandHandler("done", self.done_command))
+        self.app.add_handler(CommandHandler("search", self.search_command))
+        self.app.add_handler(CommandHandler("subtask", self.subtask_command))
+        self.app.add_handler(CommandHandler("view", self.view_task_command))
+        self.app.add_handler(edit_handler)
+        
+        # Habits
+        self.app.add_handler(CommandHandler("habit", self.habit_command))
+        self.app.add_handler(CommandHandler("habits", self.habits_command))
+        self.app.add_handler(CommandHandler("check", self.check_habit_command))
+        
+        # Notes
+        self.app.add_handler(CommandHandler("note", self.note_command))
+        self.app.add_handler(CommandHandler("notes", self.notes_command))
+        
+        # Settings
+        self.app.add_handler(CommandHandler("briefing", self.briefing_command))
+        self.app.add_handler(CommandHandler("stats", self.stats_command))
+        
+        # Callback handlers
+        self.app.add_handler(CallbackQueryHandler(self.button_callback))
+        
+        # Natural language handler
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        
+        # Schedule daily briefings
+        self.schedule_briefings()
+    
+    def schedule_briefings(self):
+        """Schedule morning and evening briefings for all users"""
+        # Morning briefing at 8 AM
+        self.scheduler.add_job(
+            self.send_morning_briefings,
+            trigger=CronTrigger(hour=8, minute=0),
+            id='morning_briefings'
+        )
+        
+        # Evening check-in at 8 PM
+        self.scheduler.add_job(
+            self.send_evening_briefings,
+            trigger=CronTrigger(hour=20, minute=0),
+            id='evening_briefings'
+        )
+    
+    async def send_morning_briefings(self):
+        """Send morning briefing to all users"""
+        # Get all users (would need a users table in production)
+        pass  # Implement when you have multiple users
+    
+    async def send_morning_briefing(self, chat_id: int, user_id: int):
+        """Send morning briefing to a user"""
+        today = datetime.now().date()
+        tasks = self.db.get_tasks_by_date(user_id, today.isoformat(), today.isoformat())
+        
+        message = "☀️ Good morning!\n\n"
+        
+        if tasks:
+            message += f"You have {len(tasks)} tasks today:\n\n"
+            for task in tasks[:5]:
+                priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+                emoji = priority_emoji.get(task['priority'], '⚪')
+                message += f"{emoji} {task['title']}\n"
+            
+            if len(tasks) > 5:
+                message += f"\n... and {len(tasks) - 5} more"
+        else:
+            message += "No tasks scheduled for today. Enjoy your day!"
+        
+        await self.app.bot.send_message(chat_id=chat_id, text=message)
+    
+    async def send_evening_briefings(self):
+        """Send evening check-in to all users"""
+        pass  # Implement when you have multiple users
+    
+    async def send_evening_briefing(self, chat_id: int, user_id: int):
+        """Send evening check-in"""
+        habits = self.db.get_habits(user_id)
+        today = datetime.now().date().isoformat()
+        
+        if not habits:
+            return
+        
+        message = "🌙 Evening check-in!\n\nDid you complete your habits today?\n\n"
+        
+        keyboard = []
+        for habit in habits:
+            completions = self.db.get_habit_completions(habit['id'], days=1)
+            if today not in completions:
+                keyboard.append([InlineKeyboardButton(
+                    f"✓ {habit['name']}", 
+                    callback_data=f"habit_{habit['id']}"
+                )])
+        
+        if keyboard:
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await self.app.bot.send_message(
+                chat_id=chat_id, 
+                text=message, 
+                reply_markup=reply_markup
+            )
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        keyboard = [
+            [InlineKeyboardButton("📋 Today's Tasks", callback_data="today")],
+            [InlineKeyboardButton("➕ Add Task", callback_data="add")],
+            [InlineKeyboardButton("📊 Stats", callback_data="stats")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await update.message.reply_text(
-            "👋 Hi! I'm your AI-powered reminder bot!\n\n"
-            "Just tell me what you want to be reminded about in plain English!\n\n"
-            "Examples:\n"
-            "• Remind me to call Steve in 30 mins\n"
-            "• Every day for the next 2 weeks remind me to exercise\n"
-            "• Every Thursday remind me about team meeting\n"
-            "• Starting next Monday, remind me daily to take vitamins\n"
-            "• Remind me every 3 days to water plants\n\n"
-            "I use AI to understand your natural language, so feel free to phrase it however you want!\n\n"
-            "Use /list to see your active reminders."
+            "👋 Welcome to your Personal Assistant!\n\n"
+            "I can help you manage tasks, track habits, take notes, and stay organized.\n\n"
+            "Use /help to see all commands, or just start talking to me naturally!",
+            reply_markup=reply_markup
         )
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "🔔 **Reminder Bot Help**\n\n"
-            "I understand natural language! Just tell me what you want and when.\n\n"
-            "**Examples:**\n"
-            "• In 30 minutes, remind me to call John\n"
-            "• Every day at 9am for a week, remind me to exercise\n"
-            "• Every Thursday at 3pm, team meeting\n"
-            "• Every other day, water the plants\n"
-            "• Starting next Monday, daily reminder to take vitamins\n"
-            "• Remind me about the dentist appointment next Friday at 2pm\n\n"
-            "**Commands:**\n"
-            "/list - See your active reminders\n"
-            "/help - Show this help message\n\n"
-            "Just type naturally - I'll figure it out! 🤖",
-            parse_mode='Markdown'
-        )
+        help_text = """**Personal Assistant Commands**
+
+**Tasks:**
+/add [task] - Add task
+/today - Today's tasks
+/tomorrow - Tomorrow's tasks
+/week - This week
+/list - All active tasks
+/projects - View by project
+/done [id] - Mark complete
+/edit [id] - Edit task
+/view [id] - View details
+/subtask [parent_id] [task] - Add subtask
+/search [query] - Find tasks
+
+**Habits:**
+/habit [name] - Add habit to track
+/habits - View all habits
+/check [habit_id] - Mark habit complete
+
+**Notes:**
+/note [text] - Quick note
+/notes - View all notes
+
+**Stats & Settings:**
+/stats - Your productivity stats
+/briefing - Set up daily briefings
+
+**Natural Language:**
+Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
+"""
+        await update.message.reply_text(help_text, parse_mode='Markdown')
     
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def add_task_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /add Your task here")
+            return
+        
+        text = ' '.join(context.args)
+        await self.create_task_from_text(update, text)
+    
+    async def create_task_from_text(self, update: Update, text: str):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
-        text = update.message.text
         
-        # Show typing indicator
-        await update.message.chat.send_action("typing")
+        # Try simple parsing first
+        simple_task = self.parse_simple_task(text)
         
-        # Parse with Groq AI
-        parsed = await self.parser.parse_reminder(text)
+        if simple_task:
+            parsed = simple_task
+        else:
+            # Use AI
+            await update.message.chat.send_action("typing")
+            parsed = await self.ai.parse_task(text)
         
-        if not parsed or 'message' not in parsed:
-            await update.message.reply_text(
-                "❌ I couldn't understand that reminder. Could you try rephrasing?\n\n"
-                "Examples:\n"
-                "• 'Remind me to call John in 2 hours'\n"
-                "• 'Every day for a week remind me to exercise'\n"
-                "• 'Every Thursday at 3pm, team meeting'"
-            )
+        if not parsed or 'title' not in parsed:
+            await update.message.reply_text("Couldn't understand. Try: /add Task description")
             return
         
-        # Schedule the reminder
-        job_id = f"reminder_{user_id}_{datetime.now().timestamp()}"
+        # Add to database
+        task_id = self.db.add_task(
+            user_id=user_id,
+            chat_id=chat_id,
+            title=parsed['title'],
+            description=parsed.get('description'),
+            priority=parsed.get('priority', 'medium'),
+            project=parsed.get('project', 'inbox'),
+            labels=parsed.get('labels'),
+            due_date=parsed.get('due_date'),
+            recurrence=parsed.get('recurrence')
+        )
         
-        try:
-            reminder_message = parsed['message']
-            reminder_type = parsed['type']
-            start_dt = datetime.fromisoformat(parsed['start_datetime'])
-            end_dt = datetime.fromisoformat(parsed['end_datetime']) if parsed.get('end_datetime') else None
-            
-            if reminder_type == "one_time":
-                self.scheduler.add_job(
-                    self.send_reminder,
-                    trigger=DateTrigger(run_date=start_dt),
-                    args=[chat_id, reminder_message, job_id],
-                    id=job_id
-                )
-                await update.message.reply_text(
-                    f"✅ Got it! I'll remind you on {start_dt.strftime('%B %d at %I:%M %p')}"
-                )
-            
-            elif reminder_type == "daily":
-                self.scheduler.add_job(
-                    self.send_reminder,
-                    trigger=CronTrigger(
-                        hour=start_dt.hour,
-                        minute=start_dt.minute,
-                        start_date=start_dt,
-                        end_date=end_dt
-                    ),
-                    args=[chat_id, reminder_message, job_id],
-                    id=job_id
-                )
-                if end_dt:
-                    await update.message.reply_text(
-                        f"✅ Daily reminder set from {start_dt.strftime('%b %d')} "
-                        f"to {end_dt.strftime('%b %d')} at {start_dt.strftime('%I:%M %p')}"
-                    )
-                else:
-                    await update.message.reply_text(
-                        f"✅ Daily reminder set starting {start_dt.strftime('%b %d at %I:%M %p')}"
-                    )
-            
-            elif reminder_type == "weekly":
-                days_of_week = parsed.get('days_of_week', [])
-                days_str = ",".join(str(d) for d in days_of_week)
-                self.scheduler.add_job(
-                    self.send_reminder,
-                    trigger=CronTrigger(
-                        day_of_week=days_str,
-                        hour=start_dt.hour,
-                        minute=start_dt.minute,
-                        start_date=start_dt,
-                        end_date=end_dt
-                    ),
-                    args=[chat_id, reminder_message, job_id],
-                    id=job_id
-                )
-                day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-                days_list = [day_names[d] for d in days_of_week]
-                await update.message.reply_text(
-                    f"✅ Weekly reminder set for {', '.join(days_list)} at {start_dt.strftime('%I:%M %p')}"
-                )
-            
-            elif reminder_type == "custom_interval":
-                interval_days = parsed.get('interval_days', 1)
-                self.scheduler.add_job(
-                    self.send_reminder,
-                    trigger=CronTrigger(
-                        day=f'*/{interval_days}',
-                        hour=start_dt.hour,
-                        minute=start_dt.minute,
-                        start_date=start_dt,
-                        end_date=end_dt
-                    ),
-                    args=[chat_id, reminder_message, job_id],
-                    id=job_id
-                )
-                await update.message.reply_text(
-                    f"✅ Reminder set every {interval_days} days starting {start_dt.strftime('%b %d')}"
-                )
-            
-            elif reminder_type == "specific_days":
-                days_of_week = parsed.get('days_of_week', [])
-                days_str = ",".join(str(d) for d in days_of_week)
-                self.scheduler.add_job(
-                    self.send_reminder,
-                    trigger=CronTrigger(
-                        day_of_week=days_str,
-                        hour=start_dt.hour,
-                        minute=start_dt.minute,
-                        start_date=start_dt,
-                        end_date=end_dt
-                    ),
-                    args=[chat_id, reminder_message, job_id],
-                    id=job_id
-                )
-                day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-                days_list = [day_names[d] for d in days_of_week]
-                await update.message.reply_text(
-                    f"✅ Reminder set for {', '.join(days_list)} at {start_dt.strftime('%I:%M %p')}"
-                )
-            
-            # Save to database
-            self.db.add_reminder(user_id, chat_id, reminder_message, reminder_type, parsed, job_id)
-            
-        except Exception as e:
-            logger.error(f"Error scheduling reminder: {e}")
-            await update.message.reply_text(
-                "❌ Sorry, there was an error setting up your reminder. Please try again."
+        # Schedule reminder
+        if parsed.get('due_date'):
+            await self.schedule_task_reminder(task_id, parsed, chat_id)
+        
+        # Response
+        priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+        response = f"{priority_emoji.get(parsed.get('priority', 'medium'), '⚪')} Task #{task_id} added\n\n"
+        response += f"**{parsed['title']}**\n"
+        
+        if parsed.get('due_date'):
+            due_dt = datetime.fromisoformat(parsed['due_date'])
+            response += f"📅 {due_dt.strftime('%b %d at %I:%M %p')}\n"
+        
+        if parsed.get('project'):
+            response += f"📁 {parsed['project'].title()}\n"
+        
+        if parsed.get('labels'):
+            response += f"🏷️ {parsed['labels']}\n"
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
+    
+    def parse_simple_task(self, text: str) -> Optional[Dict]:
+        """Quick pattern matching without AI"""
+        priority = 'medium'
+        if re.search(r'\b(urgent|important|high priority)\b', text, re.I):
+            priority = 'high'
+        elif re.search(r'\b(low priority)\b', text, re.I):
+            priority = 'low'
+        
+        # Extract hashtags as labels
+        labels = re.findall(r'#(\w+)', text)
+        text_clean = re.sub(r'#\w+', '', text).strip()
+        
+        if not re.search(r'\b(tomorrow|today|next|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d)', text, re.I):
+            return {
+                'title': text_clean,
+                'priority': priority,
+                'project': 'inbox',
+                'labels': ','.join(labels) if labels else None
+            }
+        
+        return None
+    
+    async def schedule_task_reminder(self, task_id: int, parsed: Dict, chat_id: int):
+        """Schedule reminder for task"""
+        job_id = f"task_{task_id}"
+        due_dt = datetime.fromisoformat(parsed['due_date'])
+        
+        if parsed.get('recurrence'):
+            trigger = self.get_recurrence_trigger(due_dt, parsed['recurrence'])
+            self.scheduler.add_job(
+                self.send_task_reminder,
+                trigger=trigger,
+                args=[chat_id, parsed['title'], task_id],
+                id=job_id
+            )
+        else:
+            self.scheduler.add_job(
+                self.send_task_reminder,
+                trigger=DateTrigger(run_date=due_dt),
+                args=[chat_id, parsed['title'], task_id],
+                id=job_id
             )
     
-    async def send_reminder(self, chat_id: int, message: str, job_id: str):
-        """Send the actual reminder message"""
-        try:
-            await self.app.bot.send_message(
-                chat_id=chat_id,
-                text=f"🔔 **REMINDER**\n\n{message}",
-                parse_mode='Markdown'
-            )
-            # Deactivate one-time reminders
-            self.db.deactivate_reminder(job_id)
-        except Exception as e:
-            logger.error(f"Error sending reminder: {e}")
+    def get_recurrence_trigger(self, start_time: datetime, recurrence: str):
+        """Create scheduler trigger for recurring tasks"""
+        if recurrence == 'daily':
+            return CronTrigger(hour=start_time.hour, minute=start_time.minute)
+        elif recurrence == 'weekly':
+            return CronTrigger(day_of_week=start_time.weekday(), hour=start_time.hour, minute=start_time.minute)
+        elif recurrence == 'monthly':
+            return CronTrigger(day=start_time.day, hour=start_time.hour, minute=start_time.minute)
+        return None
     
-    async def list_reminders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def today_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        reminders = self.db.get_active_reminders(user_id)
+        today = datetime.now().date()
+        tasks = self.db.get_tasks_by_date(user_id, today.isoformat(), today.isoformat())
+        await self.send_task_list(update, tasks, "📅 Today's Tasks")
+    
+    async def tomorrow_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        tomorrow = (datetime.now() + timedelta(days=1)).date()
+        tasks = self.db.get_tasks_by_date(user_id, tomorrow.isoformat(), tomorrow.isoformat())
+        await self.send_task_list(update, tasks, "📅 Tomorrow")
+    
+    async def week_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        today = datetime.now().date()
+        week_end = today + timedelta(days=7)
+        tasks = self.db.get_tasks_by_date(user_id, today.isoformat(), week_end.isoformat())
+        await self.send_task_list(update, tasks, "📅 This Week")
+    
+    async def list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        tasks = self.db.get_tasks(user_id)
+        await self.send_task_list(update, tasks, "📋 All Tasks")
+    
+    async def projects_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        tasks = self.db.get_tasks(user_id)
         
-        if not reminders:
-            await update.message.reply_text("You have no active reminders.")
+        projects = {}
+        for task in tasks:
+            proj = task['project'] or 'inbox'
+            if proj not in projects:
+                projects[proj] = []
+            projects[proj].append(task)
+        
+        message = "**📁 Projects**\n\n"
+        for project, project_tasks in projects.items():
+            message += f"**{project.title()}** ({len(project_tasks)})\n"
+            for task in project_tasks[:3]:
+                message += f"  • #{task['id']} {task['title']}\n"
+            if len(project_tasks) > 3:
+                message += f"  ... +{len(project_tasks) - 3}\n"
+            message += "\n"
+        
+        await update.message.reply_text(message or "No tasks yet.", parse_mode='Markdown')
+    
+    async def send_task_list(self, update: Update, tasks: List[Dict], title: str):
+        if not tasks:
+            await update.message.reply_text(f"{title}\n\nNo tasks found.")
             return
         
-        message = "📋 **Your Active Reminders:**\n\n"
-        for reminder in reminders[:10]:  # Show max 10
-            reminder_id, msg, r_type, schedule_info, created = reminder
-            message += f"• {msg}\n  Type: {r_type.replace('_', ' ').title()}\n\n"
+        priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
         
-        if len(reminders) > 10:
-            message += f"... and {len(reminders) - 10} more"
+        message = f"**{title}**\n\n"
+        for task in tasks[:15]:
+            emoji = priority_emoji.get(task['priority'], '⚪')
+            message += f"{emoji} **#{task['id']}** {task['title']}\n"
+            
+            if task['due_date']:
+                due = datetime.fromisoformat(task['due_date'])
+                message += f"  📅 {due.strftime('%b %d, %I:%M %p')}\n"
+            
+            if task['project'] and task['project'] != 'inbox':
+                message += f"  📁 {task['project']}\n"
+            
+            # Check for subtasks
+            subtasks = self.db.get_subtasks(task['id'])
+            if subtasks:
+                completed_sub = sum(1 for s in subtasks if s['completed'])
+                message += f"  📎 {completed_sub}/{len(subtasks)} subtasks\n"
+            
+            message += "\n"
+        
+        if len(tasks) > 15:
+            message += f"... and {len(tasks) - 15} more"
         
         await update.message.reply_text(message, parse_mode='Markdown')
+    
+    async def done_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /done [task_id]")
+            return
+        
+        try:
+            task_id = int(context.args[0])
+            self.db.complete_task(task_id)
+            await update.message.reply_text(f"✅ Task #{task_id} completed!")
+        except ValueError:
+            await update.message.reply_text("Invalid task ID.")
+    
+    async def search_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /search [query]")
+            return
+        
+        user_id = update.effective_user.id
+        query = ' '.join(context.args)
+        tasks = self.db.search_tasks(user_id, query)
+        await self.send_task_list(update, tasks, f"🔍 '{query}'")
+    
+    async def view_task_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /view [task_id]")
+            return
+        
+        try:
+            task_id = int(context.args[0])
+            task = self.db.get_task(task_id)
+            
+            if not task:
+                await update.message.reply_text("Task not found.")
+                return
+            
+            priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+            
+            message = f"{priority_emoji.get(task['priority'], '⚪')} **Task #{task['id']}**\n\n"
+            message += f"**{task['title']}**\n\n"
+            
+            if task['description']:
+                message += f"{task['description']}\n\n"
+            
+            message += f"**Priority:** {task['priority'].title()}\n"
+            message += f"**Project:** {task['project'].title()}\n"
+            
+            if task['labels']:
+                message += f"**Labels:** {task['labels']}\n"
+            
+            if task['due_date']:
+                due = datetime.fromisoformat(task['due_date'])
+                message += f"**Due:** {due.strftime('%B %d at %I:%M %p')}\n"
+            
+            if task['recurrence']:
+                message += f"**Repeats:** {task['recurrence'].title()}\n"
+            
+            # Subtasks
+            subtasks = self.db.get_subtasks(task['id'])
+            if subtasks:
+                message += f"\n**Subtasks ({len(subtasks)}):**\n"
+                for sub in subtasks:
+                    status = "✅" if sub['completed'] else "⬜"
+                    message += f"{status} {sub['title']}\n"
+            
+            keyboard = [
+                [InlineKeyboardButton("✅ Complete", callback_data=f"done_{task_id}")],
+                [InlineKeyboardButton("⏰ Snooze", callback_data=f"snooze_{task_id}")],
+                [InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{task_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(message, parse_mode='Markdown', reply_markup=reply_markup)
+        except ValueError:
+            await update.message.reply_text("Invalid task ID.")
+    
+    async def edit_task_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /edit [task_id]")
+            return ConversationHandler.END
+        
+        try:
+            task_id = int(context.args[0])
+            task = self.db.get_task(task_id)
+            
+            if not task:
+                await update.message.reply_text("Task not found.")
+                return ConversationHandler.END
+            
+            context.user_data['editing_task_id'] = task_id
+            
+            keyboard = [
+                [InlineKeyboardButton("Title", callback_data="edit_title")],
+                [InlineKeyboardButton("Priority", callback_data="edit_priority")],
+                [InlineKeyboardButton("Project", callback_data="edit_project")],
+                [InlineKeyboardButton("Due Date", callback_data="edit_due_date")],
+                [InlineKeyboardButton("Cancel", callback_data="edit_cancel")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                f"Editing task #{task_id}: {task['title']}\n\nWhat would you like to edit?",
+                reply_markup=reply_markup
+            )
+            return EDIT_FIELD
+            
+        except ValueError:
+            await update.message.reply_text("Invalid task ID.")
+            return ConversationHandler.END
+    
+    async def edit_task_field(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        task_id = context.user_data.get('editing_task_id')
+        field = context.user_data.get('editing_field')
+        new_value = update.message.text
+        
+        if field == 'title':
+            self.db.update_task(task_id, title=new_value)
+        elif field == 'priority':
+            priority = new_value.lower()
+            if priority in ['high', 'medium', 'low']:
+                self.db.update_task(task_id, priority=priority)
+            else:
+                await update.message.reply_text("Priority must be: high, medium, or low")
+                return EDIT_FIELD
+        elif field == 'project':
+            self.db.update_task(task_id, project=new_value.lower())
+        
+        await update.message.reply_text(f"✅ Task #{task_id} updated!")
+        return ConversationHandler.END
+    
+    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("Cancelled.")
+        return ConversationHandler.END
+    
+    async def subtask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /subtask [parent_id] [subtask title]")
+            return
+        
+        try:
+            parent_id = int(context.args[0])
+            title = ' '.join(context.args[1:])
+            
+            user_id = update.effective_user.id
+            chat_id = update.effective_chat.id
+            
+            subtask_id = self.db.add_task(
+                user_id=user_id,
+                chat_id=chat_id,
+                title=title,
+                parent_task_id=parent_id
+            )
+            
+            await update.message.reply_text(f"✅ Subtask #{subtask_id} added to task #{parent_id}")
+        except ValueError:
+            await update.message.reply_text("Invalid parent task ID.")
+    
+    async def habit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /habit [habit name]")
+            return
+        
+        user_id = update.effective_user.id
+        name = ' '.join(context.args)
+        habit_id = self.db.add_habit(user_id, name, 'daily')
+        
+        await update.message.reply_text(f"✅ Habit '{name}' added (ID: {habit_id})")
+    
+    async def habits_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        habits = self.db.get_habits(user_id)
+        
+        if not habits:
+            await update.message.reply_text("No habits yet. Use /habit to add one.")
+            return
+        
+        message = "**🎯 Your Habits**\n\n"
+        for habit in habits:
+            streak = self.db.get_habit_streak(habit['id'])
+            completions = self.db.get_habit_completions(habit['id'], days=7)
+            
+            message += f"**{habit['name']}** (ID: {habit['id']})\n"
+            message += f"  🔥 {streak} day streak\n"
+            message += f"  ✓ {len(completions)}/7 this week\n\n"
+        
+        await update.message.reply_text(message, parse_mode='Markdown')
+    
+    async def check_habit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /check [habit_id]")
+            return
+        
+        try:
+            habit_id = int(context.args[0])
+            success = self.db.mark_habit_complete(habit_id)
+            
+            if success:
+                streak = self.db.get_habit_streak(habit_id)
+                await update.message.reply_text(f"✅ Habit completed! 🔥 {streak} day streak")
+            else:
+                await update.message.reply_text("Already completed today!")
+        except ValueError:
+            await update.message.reply_text("Invalid habit ID.")
+    
+    async def note_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /note [your note]")
+            return
+        
+        user_id = update.effective_user.id
+        content = ' '.join(context.args)
+        self.db.add_note(user_id, None, content)
+        await update.message.reply_text("📝 Note saved!")
+    
+    async def notes_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        notes = self.db.get_notes(user_id)
+        
+        if not notes:
+            await update.message.reply_text("No notes yet.")
+            return
+        
+        message = "**📝 Notes**\n\n"
+        for note in notes[:10]:
+            created = datetime.fromisoformat(note['created_at'])
+            message += f"**{created.strftime('%b %d')}**\n{note['content']}\n\n"
+        
+        await update.message.reply_text(message, parse_mode='Markdown')
+    
+    async def briefing_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "Set your daily briefing times:\n\n"
+            "Morning briefing shows your tasks for the day\n"
+            "Evening check-in asks about habit completion\n\n"
+            "Use: /briefing morning 08:00\n"
+            "Use: /briefing evening 20:00"
+        )
+    
+    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        stats = self.db.get_stats(user_id, days=7)
+        
+        message = "**📊 Your Stats (Last 7 Days)**\n\n"
+        message += f"✅ Completed: {stats['completed']} tasks\n"
+        message += f"➕ Created: {stats['created']} tasks\n"
+        message += f"📋 Active: {stats['active']} tasks\n"
+        message += f"⚠️ Overdue: {stats['overdue']} tasks\n"
+        message += f"📈 Completion rate: {stats['completion_rate']}%\n"
+        
+        await update.message.reply_text(message, parse_mode='Markdown')
+    
+    async def send_task_reminder(self, chat_id: int, title: str, task_id: int):
+        """Send task reminder with actions"""
+        try:
+            keyboard = [
+                [InlineKeyboardButton("✅ Done", callback_data=f"done_{task_id}")],
+                [InlineKeyboardButton("⏰ Snooze 1h", callback_data=f"snooze1_{task_id}")],
+                [InlineKeyboardButton("⏰ Snooze 3h", callback_data=f"snooze3_{task_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=f"🔔 **REMINDER**\n\n{title}\n\nTask #{task_id}",
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Reminder error: {e}")
+    
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle all button callbacks"""
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data
+        
+        if data.startswith("done_"):
+            task_id = int(data.split("_")[1])
+            self.db.complete_task(task_id)
+            await query.edit_message_text(f"✅ Task #{task_id} completed!")
+        
+        elif data.startswith("snooze1_"):
+            task_id = int(data.split("_")[1])
+            task = self.db.get_task(task_id)
+            if task and task['due_date']:
+                new_due = datetime.fromisoformat(task['due_date']) + timedelta(hours=1)
+                self.db.update_task(task_id, due_date=new_due.isoformat())
+                await query.edit_message_text(f"⏰ Snoozed 1 hour")
+        
+        elif data.startswith("snooze3_"):
+            task_id = int(data.split("_")[1])
+            task = self.db.get_task(task_id)
+            if task and task['due_date']:
+                new_due = datetime.fromisoformat(task['due_date']) + timedelta(hours=3)
+                self.db.update_task(task_id, due_date=new_due.isoformat())
+                await query.edit_message_text(f"⏰ Snoozed 3 hours")
+        
+        elif data.startswith("habit_"):
+            habit_id = int(data.split("_")[1])
+            self.db.mark_habit_complete(habit_id)
+            streak = self.db.get_habit_streak(habit_id)
+            await query.edit_message_text(f"✅ Habit completed! 🔥 {streak} day streak")
+        
+        elif data == "today":
+            # Handle inline button for today's tasks
+            pass
+        
+        elif data.startswith("edit_"):
+            field = data.split("_")[1]
+            if field == "cancel":
+                await query.edit_message_text("Edit cancelled.")
+                return ConversationHandler.END
+            
+            context.user_data['editing_field'] = field
+            await query.edit_message_text(f"Send new value for {field}:")
+            return EDIT_FIELD
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle natural language"""
+        text = update.message.text
+        
+        task_indicators = ['remind', 'task', 'todo', 'call', 'meeting', 'buy', 'do', 'finish']
+        
+        if any(word in text.lower() for word in task_indicators):
+            await self.create_task_from_text(update, text)
+        else:
+            await update.message.reply_text(
+                "I can help with tasks, habits, and notes!\n"
+                "Try saying: 'call Steve tomorrow at 3pm'\n"
+                "Or use /help for all commands."
+            )
     
     def run(self):
         """Start the bot"""
         self.scheduler.start()
-        logger.info("Bot is starting...")
+        logger.info("Personal Assistant Bot starting...")
         self.app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    # Get tokens from environment variables
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
     
     if not TELEGRAM_TOKEN or not GROQ_API_KEY:
-        logger.error("Missing required environment variables!")
-        logger.error("Please set TELEGRAM_BOT_TOKEN and GROQ_API_KEY")
+        logger.error("Missing environment variables!")
         exit(1)
     
-    bot = TelegramReminderBot(TELEGRAM_TOKEN, GROQ_API_KEY)
+    bot = PersonalAssistantBot(TELEGRAM_TOKEN, GROQ_API_KEY)
     bot.run()
