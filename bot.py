@@ -544,10 +544,11 @@ class PersonalAssistantBot:
         self.app.add_handler(CommandHandler("note", self.note_command))
         self.app.add_handler(CommandHandler("notes", self.notes_command))
         
-        # Settings
+        # Stats & Settings
         self.app.add_handler(CommandHandler("briefing", self.briefing_command))
         self.app.add_handler(CommandHandler("stats", self.stats_command))
-        
+        self.app.add_handler(CommandHandler("debug", self.debug_command))
+
         # Callback handlers
         self.app.add_handler(CallbackQueryHandler(self.button_callback))
         
@@ -1162,6 +1163,29 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
             "Use: /briefing evening 20:00"
         )
     
+    async def debug_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send debug info about tasks for the user."""
+        user_id = update.effective_user.id
+        conn = self.db.get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
+            SELECT id, title, due_date, 
+                   due_date::date as date_only,
+                   timezone('Europe/London', due_date) as uk_time
+            FROM tasks 
+            WHERE user_id = %s AND completed = 0
+            ORDER BY due_date
+        ''', (user_id,))
+        results = cursor.fetchall()
+        conn.close()
+        message = "Debug info:\n\n"
+        for row in results:
+            message += f"ID: {row['id']}\n"
+            message += f"Title: {row['title']}\n"
+            message += f"Due: {row['due_date']}\n"
+            message += f"Date only: {row['date_only']}\n\n"
+        await update.message.reply_text(message or "No tasks")
+
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         stats = self.db.get_stats(user_id, days=7)
