@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, time
 from typing import Optional, List, Dict
 import sqlite3
 import re
+from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
@@ -113,7 +114,7 @@ class Database:
                              labels, due_date, recurrence, parent_task_id, created_at, job_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (user_id, chat_id, title, description, priority, project, labels, due_date, 
-              recurrence, parent_task_id, datetime.now().isoformat(), job_id))
+              recurrence, parent_task_id, datetime.now(ZoneInfo('Europe/London')).isoformat(), job_id))
         
         task_id = cursor.lastrowid
         conn.commit()
@@ -130,7 +131,7 @@ class Database:
             updates.append(f"{key} = ?")
             values.append(value)
         
-        values.append(datetime.now().isoformat())
+        values.append(datetime.now(ZoneInfo('Europe/London')).isoformat())
         values.append(task_id)
         
         query = f"UPDATE tasks SET {', '.join(updates)}, updated_at = ? WHERE id = ?"
@@ -290,7 +291,8 @@ class Database:
     
     def mark_habit_complete(self, habit_id: int, date: str = None):
         if not date:
-            date = datetime.now().date().isoformat()
+            # Use UK timezone for habit completion
+            date = datetime.now(ZoneInfo('Europe/London')).date().isoformat()
         
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -325,7 +327,7 @@ class Database:
             return 0
         
         streak = 0
-        current_date = datetime.now().date()
+        current_date = datetime.now(ZoneInfo('Europe/London')).date()
         
         for date_str in dates:
             date = datetime.fromisoformat(date_str).date()
@@ -340,7 +342,7 @@ class Database:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        start_date = (datetime.now() - timedelta(days=days)).date().isoformat()
+        start_date = (datetime.now(ZoneInfo('Europe/London')) - timedelta(days=days)).date().isoformat()
         cursor.execute('''
             SELECT completed_date FROM habit_completions 
             WHERE habit_id = ? AND completed_date >= ?
@@ -400,7 +402,7 @@ class Database:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        start_date = (datetime.now() - timedelta(days=days)).date().isoformat()
+        start_date = (datetime.now(ZoneInfo('Europe/London')) - timedelta(days=days)).date().isoformat()
         
         # Tasks completed
         cursor.execute('''
@@ -424,7 +426,7 @@ class Database:
         cursor.execute('''
             SELECT COUNT(*) FROM tasks 
             WHERE user_id = ? AND completed = 0 AND due_date < ?
-        ''', (user_id, datetime.now().isoformat()))
+        ''', (user_id, datetime.now(ZoneInfo('Europe/London')).isoformat()))
         overdue = cursor.fetchone()[0]
         
         conn.close()
@@ -446,9 +448,12 @@ class AIParser:
         self.base_url = "https://api.groq.com/openai/v1/chat/completions"
     
     async def parse_task(self, text: str) -> Optional[Dict]:
+        # Get current UK time
+        uk_time = datetime.now(ZoneInfo('Europe/London'))
+        
         system_prompt = """Extract task information from natural language. Return ONLY valid JSON.
 
-Current date: {current_date}
+Current date/time (UK): {current_date}
 
 Extract:
 - "title": Main task (string)
@@ -467,7 +472,7 @@ Examples:
 "high priority: finish report by Friday"
 {{"title": "finish report", "description": null, "priority": "high", "project": "work", "due_date": "2025-10-03", "recurrence": null}}
 
-Return ONLY JSON.""".format(current_date=datetime.now().strftime("%Y-%m-%d %H:%M"))
+Return ONLY JSON.""".format(current_date=uk_time.strftime("%Y-%m-%d %H:%M %Z"))
         
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
@@ -511,9 +516,10 @@ class PersonalAssistantBot:
     
     def __init__(self, telegram_token: str, groq_api_key: str):
         self.app = Application.builder().token(telegram_token).build()
-        self.scheduler = AsyncIOScheduler()
+        self.scheduler = AsyncIOScheduler(timezone='Europe/London')  # UK timezone
         self.db = Database()
         self.ai = AIParser(groq_api_key)
+        self.user_timezone = ZoneInfo('Europe/London')  # Default to UK time
         
         # Conversation handler for editing
         edit_handler = ConversationHandler(
@@ -585,7 +591,7 @@ class PersonalAssistantBot:
     
     async def send_morning_briefing(self, chat_id: int, user_id: int):
         """Send morning briefing to a user"""
-        today = datetime.now().date()
+        today = datetime.now(self.user_timezone).date()
         tasks = self.db.get_tasks_by_date(user_id, today.isoformat(), today.isoformat())
         
         message = "☀️ Good morning!\n\n"
@@ -611,7 +617,7 @@ class PersonalAssistantBot:
     async def send_evening_briefing(self, chat_id: int, user_id: int):
         """Send evening check-in"""
         habits = self.db.get_habits(user_id)
-        today = datetime.now().date().isoformat()
+        today = datetime.now(self.user_timezone).date().isoformat()
         
         if not habits:
             return
@@ -802,19 +808,19 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
     
     async def today_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        today = datetime.now().date()
+        today = datetime.now(self.user_timezone).date()
         tasks = self.db.get_tasks_by_date(user_id, today.isoformat(), today.isoformat())
         await self.send_task_list(update, tasks, "📅 Today's Tasks")
     
     async def tomorrow_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        tomorrow = (datetime.now() + timedelta(days=1)).date()
+        tomorrow = (datetime.now(self.user_timezone) + timedelta(days=1)).date()
         tasks = self.db.get_tasks_by_date(user_id, tomorrow.isoformat(), tomorrow.isoformat())
         await self.send_task_list(update, tasks, "📅 Tomorrow")
     
     async def week_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        today = datetime.now().date()
+        today = datetime.now(self.user_timezone).date()
         week_end = today + timedelta(days=7)
         tasks = self.db.get_tasks_by_date(user_id, today.isoformat(), week_end.isoformat())
         await self.send_task_list(update, tasks, "📅 This Week")
