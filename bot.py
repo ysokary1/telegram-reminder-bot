@@ -3,9 +3,10 @@ import json
 import logging
 from datetime import datetime, timedelta, time
 from typing import Optional, List, Dict
-import sqlite3
 import re
 from zoneinfo import ZoneInfo
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
@@ -25,34 +26,39 @@ EDIT_FIELD, SNOOZE_TIME = range(2)
 
 
 class Database:
-    """Comprehensive database for all PA features"""
+    """Comprehensive database for all PA features using PostgreSQL"""
     
-    def __init__(self, db_path="assistant.db"):
-        self.db_path = db_path
+    def __init__(self):
+        self.database_url = os.environ.get("DATABASE_URL")
+        if not self.database_url:
+            raise ValueError("DATABASE_URL environment variable not set")
         self.init_db()
     
+    def get_connection(self):
+        return psycopg2.connect(self.database_url)
+    
     def init_db(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = self.get_connection()
         cursor = conn.cursor()
         
         # Tasks table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                chat_id BIGINT NOT NULL,
                 title TEXT NOT NULL,
                 description TEXT,
                 priority TEXT DEFAULT 'medium',
                 project TEXT DEFAULT 'inbox',
                 labels TEXT,
-                due_date TEXT,
+                due_date TIMESTAMP,
                 recurrence TEXT,
                 parent_task_id INTEGER,
                 completed INTEGER DEFAULT 0,
-                completed_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT,
+                completed_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP,
                 job_id TEXT
             )
         ''')
@@ -60,31 +66,31 @@ class Database:
         # Notes table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
                 title TEXT,
                 content TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TIMESTAMP NOT NULL
             )
         ''')
         
         # Habits table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS habits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
                 name TEXT NOT NULL,
                 goal_frequency TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TIMESTAMP NOT NULL
             )
         ''')
         
         # Habit completions
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS habit_completions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 habit_id INTEGER NOT NULL,
-                completed_date TEXT NOT NULL,
+                completed_date DATE NOT NULL,
                 FOREIGN KEY (habit_id) REFERENCES habits (id)
             )
         ''')
@@ -92,7 +98,7 @@ class Database:
         # User preferences
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS user_preferences (
-                user_id INTEGER PRIMARY KEY,
+                user_id BIGINT PRIMARY KEY,
                 morning_briefing_time TEXT,
                 evening_briefing_time TEXT,
                 timezone TEXT DEFAULT 'UTC'
@@ -106,73 +112,67 @@ class Database:
                  priority: str = 'medium', project: str = 'inbox', labels: str = None,
                  due_date: str = None, recurrence: str = None, parent_task_id: int = None,
                  job_id: str = None) -> int:
-        conn = sqlite3.connect(self.db_path)
+        conn = self.get_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
             INSERT INTO tasks (user_id, chat_id, title, description, priority, project, 
                              labels, due_date, recurrence, parent_task_id, created_at, job_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
         ''', (user_id, chat_id, title, description, priority, project, labels, due_date, 
-              recurrence, parent_task_id, datetime.now(ZoneInfo('Europe/London')).isoformat(), job_id))
+              recurrence, parent_task_id, datetime.now(ZoneInfo('Europe/London')), job_id))
         
-        task_id = cursor.lastrowid
+        task_id = cursor.fetchone()[0]
         conn.commit()
         conn.close()
         return task_id
     
     def update_task(self, task_id: int, **kwargs):
-        conn = sqlite3.connect(self.db_path)
+        conn = self.get_connection()
         cursor = conn.cursor()
         
         updates = []
         values = []
         for key, value in kwargs.items():
-            updates.append(f"{key} = ?")
+            updates.append(f"{key} = %s")
             values.append(value)
         
-        values.append(datetime.now(ZoneInfo('Europe/London')).isoformat())
+        values.append(datetime.now(ZoneInfo('Europe/London')))
         values.append(task_id)
         
-        query = f"UPDATE tasks SET {', '.join(updates)}, updated_at = ? WHERE id = ?"
+        query = f"UPDATE tasks SET {', '.join(updates)}, updated_at = %s WHERE id = %s"
         cursor.execute(query, values)
         conn.commit()
         conn.close()
     
     def get_task(self, task_id: int) -> Optional[Dict]:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM tasks WHERE id = ?', (task_id,))
-        row = cursor.fetchone()
-        
-        if row:
-            columns = [description[0] for description in cursor.description]
-            result = dict(zip(columns, row))
-        else:
-            result = None
-        
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('SELECT * FROM tasks WHERE id = %s', (task_id,))
+        result = cursor.fetchone()
         conn.close()
-        return result
+        return dict(result) if result else None
     
     def get_tasks(self, user_id: int, completed: bool = False, 
                   project: str = None, priority: str = None,
                   parent_task_id: int = None) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        query = 'SELECT * FROM tasks WHERE user_id = ? AND completed = ?'
+        query = 'SELECT * FROM tasks WHERE user_id = %s AND completed = %s'
         params = [user_id, 1 if completed else 0]
         
         if project:
-            query += ' AND project = ?'
+            query += ' AND project = %s'
             params.append(project)
         
         if priority:
-            query += ' AND priority = ?'
+            query += ' AND priority = %s'
             params.append(priority)
         
         if parent_task_id is not None:
-            query += ' AND parent_task_id = ?'
+            query += ' AND parent_task_id = %s'
             params.append(parent_task_id)
         elif parent_task_id is None:
             query += ' AND parent_task_id IS NULL'
@@ -180,112 +180,105 @@ class Database:
         query += ' ORDER BY due_date ASC, priority DESC, created_at DESC'
         
         cursor.execute(query, params)
-        columns = [description[0] for description in cursor.description]
-        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        results = [dict(row) for row in cursor.fetchall()]
         
         conn.close()
         return results
     
     def get_tasks_by_date(self, user_id: int, start_date: str, end_date: str) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         cursor.execute('''
             SELECT * FROM tasks 
-            WHERE user_id = ? AND completed = 0 
-            AND due_date >= ? AND due_date <= ?
+            WHERE user_id = %s AND completed = 0 
+            AND due_date >= %s AND due_date <= %s
             ORDER BY due_date ASC, priority DESC
         ''', (user_id, start_date, end_date))
         
-        columns = [description[0] for description in cursor.description]
-        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
-        
+        results = [dict(row) for row in cursor.fetchall()]
         conn.close()
         return results
     
     def complete_task(self, task_id: int):
-        conn = sqlite3.connect(self.db_path)
+        conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            UPDATE tasks SET completed = 1, completed_at = ? WHERE id = ?
-        ''', (datetime.now().isoformat(), task_id))
+            UPDATE tasks SET completed = 1, completed_at = %s WHERE id = %s
+        ''', (datetime.now(ZoneInfo('Europe/London')), task_id))
         conn.commit()
         conn.close()
     
     def delete_task(self, task_id: int):
-        conn = sqlite3.connect(self.db_path)
+        conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM tasks WHERE id = ? OR parent_task_id = ?', (task_id, task_id))
+        cursor.execute('DELETE FROM tasks WHERE id = %s OR parent_task_id = %s', (task_id, task_id))
         conn.commit()
         conn.close()
     
     def search_tasks(self, user_id: int, query: str) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         cursor.execute('''
             SELECT * FROM tasks 
-            WHERE user_id = ? AND completed = 0 
-            AND (title LIKE ? OR description LIKE ? OR labels LIKE ?)
+            WHERE user_id = %s AND completed = 0 
+            AND (title ILIKE %s OR description ILIKE %s OR labels ILIKE %s)
             ORDER BY due_date ASC, priority DESC
         ''', (user_id, f'%{query}%', f'%{query}%', f'%{query}%'))
         
-        columns = [description[0] for description in cursor.description]
-        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
-        
+        results = [dict(row) for row in cursor.fetchall()]
         conn.close()
         return results
     
     def get_subtasks(self, parent_id: int) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        cursor.execute('SELECT * FROM tasks WHERE parent_task_id = ?', (parent_id,))
-        columns = [description[0] for description in cursor.description]
-        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        cursor.execute('SELECT * FROM tasks WHERE parent_task_id = %s', (parent_id,))
+        results = [dict(row) for row in cursor.fetchall()]
         
         conn.close()
         return results
     
     # Notes
     def add_note(self, user_id: int, title: str, content: str):
-        conn = sqlite3.connect(self.db_path)
+        conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO notes (user_id, title, content, created_at)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, title, content, datetime.now().isoformat()))
+            VALUES (%s, %s, %s, %s)
+        ''', (user_id, title, content, datetime.now(ZoneInfo('Europe/London'))))
         conn.commit()
         conn.close()
     
     def get_notes(self, user_id: int) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM notes WHERE user_id = ? ORDER BY created_at DESC', (user_id,))
-        columns = [description[0] for description in cursor.description]
-        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('SELECT * FROM notes WHERE user_id = %s ORDER BY created_at DESC', (user_id,))
+        results = [dict(row) for row in cursor.fetchall()]
         conn.close()
         return results
     
     # Habits
     def add_habit(self, user_id: int, name: str, goal_frequency: str) -> int:
-        conn = sqlite3.connect(self.db_path)
+        conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO habits (user_id, name, goal_frequency, created_at)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, name, goal_frequency, datetime.now().isoformat()))
-        habit_id = cursor.lastrowid
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+        ''', (user_id, name, goal_frequency, datetime.now(ZoneInfo('Europe/London'))))
+        habit_id = cursor.fetchone()[0]
         conn.commit()
         conn.close()
         return habit_id
     
     def get_habits(self, user_id: int) -> List[Dict]:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM habits WHERE user_id = ?', (user_id,))
-        columns = [description[0] for description in cursor.description]
-        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('SELECT * FROM habits WHERE user_id = %s', (user_id,))
+        results = [dict(row) for row in cursor.fetchall()]
         conn.close()
         return results
     
@@ -294,29 +287,29 @@ class Database:
             # Use UK timezone for habit completion
             date = datetime.now(ZoneInfo('Europe/London')).date().isoformat()
         
-        conn = sqlite3.connect(self.db_path)
+        conn = self.get_connection()
         cursor = conn.cursor()
         
         # Check if already marked
-        cursor.execute('SELECT id FROM habit_completions WHERE habit_id = ? AND completed_date = ?',
+        cursor.execute('SELECT id FROM habit_completions WHERE habit_id = %s AND completed_date = %s',
                       (habit_id, date))
         if cursor.fetchone():
             conn.close()
             return False
         
-        cursor.execute('INSERT INTO habit_completions (habit_id, completed_date) VALUES (?, ?)',
+        cursor.execute('INSERT INTO habit_completions (habit_id, completed_date) VALUES (%s, %s)',
                       (habit_id, date))
         conn.commit()
         conn.close()
         return True
     
     def get_habit_streak(self, habit_id: int) -> int:
-        conn = sqlite3.connect(self.db_path)
+        conn = self.get_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
             SELECT completed_date FROM habit_completions 
-            WHERE habit_id = ? 
+            WHERE habit_id = %s 
             ORDER BY completed_date DESC
         ''', (habit_id,))
         
@@ -329,8 +322,13 @@ class Database:
         streak = 0
         current_date = datetime.now(ZoneInfo('Europe/London')).date()
         
-        for date_str in dates:
-            date = datetime.fromisoformat(date_str).date()
+        for date_obj in dates:
+            # Handle both date objects and strings
+            if isinstance(date_obj, str):
+                date = datetime.fromisoformat(date_obj).date()
+            else:
+                date = date_obj
+                
             if date == current_date - timedelta(days=streak):
                 streak += 1
             else:
@@ -339,94 +337,87 @@ class Database:
         return streak
     
     def get_habit_completions(self, habit_id: int, days: int = 30) -> List[str]:
-        conn = sqlite3.connect(self.db_path)
+        conn = self.get_connection()
         cursor = conn.cursor()
         
-        start_date = (datetime.now(ZoneInfo('Europe/London')) - timedelta(days=days)).date().isoformat()
+        start_date = (datetime.now(ZoneInfo('Europe/London')) - timedelta(days=days)).date()
         cursor.execute('''
             SELECT completed_date FROM habit_completions 
-            WHERE habit_id = ? AND completed_date >= ?
+            WHERE habit_id = %s AND completed_date >= %s
             ORDER BY completed_date DESC
         ''', (habit_id, start_date))
         
-        results = [row[0] for row in cursor.fetchall()]
+        results = [row[0].isoformat() if hasattr(row[0], 'isoformat') else row[0] for row in cursor.fetchall()]
         conn.close()
         return results
     
     # User preferences
     def set_briefing_times(self, user_id: int, morning: str = None, evening: str = None):
-        conn = sqlite3.connect(self.db_path)
+        conn = self.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute('SELECT user_id FROM user_preferences WHERE user_id = ?', (user_id,))
+        cursor.execute('SELECT user_id FROM user_preferences WHERE user_id = %s', (user_id,))
         exists = cursor.fetchone()
         
         if exists:
             updates = []
             params = []
             if morning:
-                updates.append('morning_briefing_time = ?')
+                updates.append('morning_briefing_time = %s')
                 params.append(morning)
             if evening:
-                updates.append('evening_briefing_time = ?')
+                updates.append('evening_briefing_time = %s')
                 params.append(evening)
             params.append(user_id)
             
-            cursor.execute(f'UPDATE user_preferences SET {", ".join(updates)} WHERE user_id = ?', params)
+            cursor.execute(f'UPDATE user_preferences SET {", ".join(updates)} WHERE user_id = %s', params)
         else:
             cursor.execute('''
                 INSERT INTO user_preferences (user_id, morning_briefing_time, evening_briefing_time)
-                VALUES (?, ?, ?)
+                VALUES (%s, %s, %s)
             ''', (user_id, morning, evening))
         
         conn.commit()
         conn.close()
     
     def get_user_preferences(self, user_id: int) -> Optional[Dict]:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM user_preferences WHERE user_id = ?', (user_id,))
-        row = cursor.fetchone()
-        
-        if row:
-            columns = [description[0] for description in cursor.description]
-            result = dict(zip(columns, row))
-        else:
-            result = None
-        
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('SELECT * FROM user_preferences WHERE user_id = %s', (user_id,))
+        result = cursor.fetchone()
         conn.close()
-        return result
+        return dict(result) if result else None
     
     # Stats
     def get_stats(self, user_id: int, days: int = 7) -> Dict:
-        conn = sqlite3.connect(self.db_path)
+        conn = self.get_connection()
         cursor = conn.cursor()
         
-        start_date = (datetime.now(ZoneInfo('Europe/London')) - timedelta(days=days)).date().isoformat()
+        start_date = (datetime.now(ZoneInfo('Europe/London')) - timedelta(days=days)).date()
         
         # Tasks completed
         cursor.execute('''
             SELECT COUNT(*) FROM tasks 
-            WHERE user_id = ? AND completed = 1 AND completed_at >= ?
+            WHERE user_id = %s AND completed = 1 AND completed_at >= %s
         ''', (user_id, start_date))
         completed = cursor.fetchone()[0]
         
         # Tasks created
         cursor.execute('''
             SELECT COUNT(*) FROM tasks 
-            WHERE user_id = ? AND created_at >= ?
+            WHERE user_id = %s AND created_at >= %s
         ''', (user_id, start_date))
         created = cursor.fetchone()[0]
         
         # Active tasks
-        cursor.execute('SELECT COUNT(*) FROM tasks WHERE user_id = ? AND completed = 0', (user_id,))
+        cursor.execute('SELECT COUNT(*) FROM tasks WHERE user_id = %s AND completed = 0', (user_id,))
         active = cursor.fetchone()[0]
         
         # Overdue tasks
         cursor.execute('''
             SELECT COUNT(*) FROM tasks 
-            WHERE user_id = ? AND completed = 0 AND due_date < ?
-        ''', (user_id, datetime.now(ZoneInfo('Europe/London')).isoformat()))
+            WHERE user_id = %s AND completed = 0 AND due_date < %s
+        ''', (user_id, datetime.now(ZoneInfo('Europe/London'))))
         overdue = cursor.fetchone()[0]
         
         conn.close()
