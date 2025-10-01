@@ -143,7 +143,7 @@ Return ONLY the JSON object, no other text.""".format(
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "llama-3.1-70b-versatile",
+                        "model": "llama-3.3-70b-versatile",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": text}
