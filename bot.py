@@ -724,6 +724,7 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
         # Schedule reminder
         if parsed.get('due_date'):
             await self.schedule_task_reminder(task_id, parsed, chat_id)
+            logger.info(f"Scheduled reminder for task {task_id} at {parsed.get('due_date')}")
         
         # Response
         priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
@@ -769,23 +770,55 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
     async def schedule_task_reminder(self, task_id: int, parsed: Dict, chat_id: int):
         """Schedule reminder for task"""
         job_id = f"task_{task_id}"
-        due_dt = datetime.fromisoformat(parsed['due_date'])
+        
+        # Parse the due_date string and make it timezone-aware
+        due_date_str = parsed['due_date']
+        
+        # Handle both string and datetime inputs
+        if isinstance(due_date_str, str):
+            # Parse ISO format string
+            if 'T' in due_date_str:
+                # Has time component
+                due_dt = datetime.fromisoformat(due_date_str.replace('Z', '+00:00'))
+            else:
+                # Date only - add default time
+                due_dt = datetime.fromisoformat(due_date_str)
+                due_dt = due_dt.replace(hour=9, minute=0)  # Default to 9 AM
+            
+            # Make timezone-aware if it isn't already
+            if due_dt.tzinfo is None:
+                due_dt = due_dt.replace(tzinfo=self.user_timezone)
+        else:
+            due_dt = due_date_str
+        
+        # Convert to UK timezone if in different timezone
+        if due_dt.tzinfo != self.user_timezone:
+            due_dt = due_dt.astimezone(self.user_timezone)
+        
+        # Update task with the job_id
+        self.db.update_task(task_id, job_id=job_id)
         
         if parsed.get('recurrence'):
             trigger = self.get_recurrence_trigger(due_dt, parsed['recurrence'])
-            self.scheduler.add_job(
-                self.send_task_reminder,
-                trigger=trigger,
-                args=[chat_id, parsed['title'], task_id],
-                id=job_id
-            )
+            if trigger:
+                self.scheduler.add_job(
+                    self.send_task_reminder,
+                    trigger=trigger,
+                    args=[chat_id, parsed['title'], task_id],
+                    id=job_id,
+                    replace_existing=True
+                )
         else:
-            self.scheduler.add_job(
-                self.send_task_reminder,
-                trigger=DateTrigger(run_date=due_dt),
-                args=[chat_id, parsed['title'], task_id],
-                id=job_id
-            )
+            # Only schedule if the time is in the future
+            now = datetime.now(self.user_timezone)
+            if due_dt > now:
+                self.scheduler.add_job(
+                    self.send_task_reminder,
+                    trigger=DateTrigger(run_date=due_dt),
+                    args=[chat_id, parsed['title'], task_id],
+                    id=job_id,
+                    replace_existing=True
+                )
     
     def get_recurrence_trigger(self, start_time: datetime, recurrence: str):
         """Create scheduler trigger for recurring tasks"""
@@ -1183,16 +1216,70 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
             task_id = int(data.split("_")[1])
             task = self.db.get_task(task_id)
             if task and task['due_date']:
-                new_due = datetime.fromisoformat(task['due_date']) + timedelta(minutes=5)
-                self.db.update_task(task_id, due_date=new_due.isoformat())
+                # Parse current due_date
+                if isinstance(task['due_date'], str):
+                    current_due = datetime.fromisoformat(task['due_date'])
+                else:
+                    current_due = task['due_date']
+                
+                # Make timezone-aware if needed
+                if current_due.tzinfo is None:
+                    current_due = current_due.replace(tzinfo=self.user_timezone)
+                
+                # Add 5 minutes
+                new_due = current_due + timedelta(minutes=5)
+                self.db.update_task(task_id, due_date=new_due)
+                
+                # Reschedule the reminder
+                job_id = f"task_{task_id}"
+                try:
+                    self.scheduler.remove_job(job_id)
+                except:
+                    pass
+                
+                self.scheduler.add_job(
+                    self.send_task_reminder,
+                    trigger=DateTrigger(run_date=new_due),
+                    args=[query.message.chat_id, task['title'], task_id],
+                    id=job_id,
+                    replace_existing=True
+                )
+                
                 await query.edit_message_text(f"⏰ Snoozed 5 minutes")
         
         elif data.startswith("snooze60_"):
             task_id = int(data.split("_")[1])
             task = self.db.get_task(task_id)
             if task and task['due_date']:
-                new_due = datetime.fromisoformat(task['due_date']) + timedelta(hours=1)
-                self.db.update_task(task_id, due_date=new_due.isoformat())
+                # Parse current due_date
+                if isinstance(task['due_date'], str):
+                    current_due = datetime.fromisoformat(task['due_date'])
+                else:
+                    current_due = task['due_date']
+                
+                # Make timezone-aware if needed
+                if current_due.tzinfo is None:
+                    current_due = current_due.replace(tzinfo=self.user_timezone)
+                
+                # Add 1 hour
+                new_due = current_due + timedelta(hours=1)
+                self.db.update_task(task_id, due_date=new_due)
+                
+                # Reschedule the reminder
+                job_id = f"task_{task_id}"
+                try:
+                    self.scheduler.remove_job(job_id)
+                except:
+                    pass
+                
+                self.scheduler.add_job(
+                    self.send_task_reminder,
+                    trigger=DateTrigger(run_date=new_due),
+                    args=[query.message.chat_id, task['title'], task_id],
+                    id=job_id,
+                    replace_existing=True
+                )
+                
                 await query.edit_message_text(f"⏰ Snoozed 1 hour")
         
         elif data.startswith("habit_"):
@@ -1234,6 +1321,9 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
         """Start the bot"""
         self.scheduler.start()
         logger.info("Personal Assistant Bot starting...")
+        logger.info(f"Scheduler started: {self.scheduler.running}")
+        logger.info(f"Using timezone: Europe/London")
+        logger.info(f"Current time: {datetime.now(self.user_timezone)}")
         
         # Set up command descriptions
         async def set_commands():
