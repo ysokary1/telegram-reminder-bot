@@ -188,15 +188,12 @@ class Database:
     def get_tasks_by_date(self, user_id: int, start_date: str, end_date: str) -> List[Dict]:
         conn = self.get_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        # Add time boundaries to make date comparison work with timestamps
-        start_datetime = f"{start_date} 00:00:00"
-        end_datetime = f"{end_date} 23:59:59"
         cursor.execute('''
             SELECT * FROM tasks 
             WHERE user_id = %s AND completed = 0 
-            AND due_date >= %s AND due_date <= %s
+            AND DATE(due_date) >= %s::date AND DATE(due_date) <= %s::date
             ORDER BY due_date ASC, priority DESC
-        ''', (user_id, start_datetime, end_datetime))
+        ''', (user_id, start_date, end_date))
         results = [dict(row) for row in cursor.fetchall()]
         conn.close()
         return results
