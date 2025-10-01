@@ -16,7 +16,7 @@ import httpx
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=ває.INFO
 )
 logger = logging.getLogger(__name__)
 
@@ -90,15 +90,15 @@ class ReminderDatabase:
         conn.close()
 
 
-class DeepSeekParser:
-    """Uses DeepSeek AI to parse natural language reminders"""
+class GroqParser:
+    """Uses Groq AI to parse natural language reminders"""
     
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "https://api.deepseek.com/v1/chat/completions"
+        self.base_url = "https://api.groq.com/openai/v1/chat/completions"
     
     async def parse_reminder(self, text: str) -> Optional[dict]:
-        """Use DeepSeek to parse reminder text into structured format"""
+        """Use Groq to parse reminder text into structured format"""
         
         system_prompt = """You are a reminder parsing assistant. Extract reminder information from natural language and return ONLY a valid JSON object.
 
@@ -116,19 +116,19 @@ Parse the user's message and return a JSON object with these fields:
 Examples:
 
 Input: "remind me to call Steve in 30 minutes"
-Output: {{"message": "call Steve", "type": "one_time", "start_datetime": "2025-10-01T15:30:00", "end_datetime": null, "days_of_week": null, "interval_days": null, "time_of_day": null}}
+Output: {{"message": "call Steve", "type": "one_time", "start_datetime": "2025-10-01T19:00:00", "end_datetime": null, "days_of_week": null, "interval_days": null, "time_of_day": null}}
 
 Input: "every day for 2 weeks remind me to exercise"
 Output: {{"message": "exercise", "type": "daily", "start_datetime": "2025-10-02T09:00:00", "end_datetime": "2025-10-16T09:00:00", "days_of_week": null, "interval_days": null, "time_of_day": "09:00"}}
 
 Input: "every Thursday at 3pm remind me about team meeting"
-Output: {{"message": "team meeting", "type": "weekly", "start_datetime": "2025-10-02T15:00:00", "end_datetime": null, "days_of_week": [3], "interval_days": null, "time_of_day": "15:00"}}
+Output: {{"message": "team meeting", "type": "weekly", "start_datetime": "2025-10-03T15:00:00", "end_datetime": null, "days_of_week": [3], "interval_days": null, "time_of_day": "15:00"}}
 
 Input: "every 3 days remind me to water plants"
 Output: {{"message": "water plants", "type": "custom_interval", "start_datetime": "2025-10-01T09:00:00", "end_datetime": null, "days_of_week": null, "interval_days": 3, "time_of_day": "09:00"}}
 
 Input: "starting next Monday, remind me daily to take vitamins"
-Output: {{"message": "take vitamins", "type": "daily", "start_datetime": "2025-10-06T09:00:00", "end_datetime": null, "days_of_week": null, "interval_days": null, "time_of_day": "09:00"}}
+Output: {{"message": "take vitamins", "type": "daily", "start_datetime": "2025-10-07T09:00:00", "end_datetime": null, "days_of_week": null, "interval_days": null, "time_of_day": "09:00"}}
 
 Return ONLY the JSON object, no other text.""".format(
             current_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -143,7 +143,7 @@ Return ONLY the JSON object, no other text.""".format(
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "deepseek-chat",
+                        "model": "llama-3.1-70b-versatile",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": text}
@@ -154,7 +154,7 @@ Return ONLY the JSON object, no other text.""".format(
                 )
                 
                 if response.status_code != 200:
-                    logger.error(f"DeepSeek API error: {response.status_code} - {response.text}")
+                    logger.error(f"Groq API error: {response.status_code} - {response.text}")
                     return None
                 
                 result = response.json()
@@ -171,19 +171,19 @@ Return ONLY the JSON object, no other text.""".format(
                 return parsed
                 
         except Exception as e:
-            logger.error(f"Error calling DeepSeek API: {e}")
+            logger.error(f"Error calling Groq API: {e}")
             return None
 
 
 class TelegramReminderBot:
     """Main bot class"""
     
-    def __init__(self, telegram_token: str, deepseek_api_key: str):
+    def __init__(self, telegram_token: str, groq_api_key: str):
         self.telegram_token = telegram_token
         self.app = Application.builder().token(telegram_token).build()
         self.scheduler = AsyncIOScheduler()
         self.db = ReminderDatabase()
-        self.parser = DeepSeekParser(deepseek_api_key)
+        self.parser = GroqParser(groq_api_key)
         
         # Add handlers
         self.app.add_handler(CommandHandler("start", self.start_command))
@@ -231,7 +231,7 @@ class TelegramReminderBot:
         # Show typing indicator
         await update.message.chat.send_action("typing")
         
-        # Parse with DeepSeek AI
+        # Parse with Groq AI
         parsed = await self.parser.parse_reminder(text)
         
         if not parsed or 'message' not in parsed:
@@ -396,12 +396,12 @@ class TelegramReminderBot:
 if __name__ == "__main__":
     # Get tokens from environment variables
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-    DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+    GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
     
-    if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
+    if not TELEGRAM_TOKEN or not GROQ_API_KEY:
         logger.error("Missing required environment variables!")
-        logger.error("Please set TELEGRAM_BOT_TOKEN and DEEPSEEK_API_KEY")
+        logger.error("Please set TELEGRAM_BOT_TOKEN and GROQ_API_KEY")
         exit(1)
     
-    bot = TelegramReminderBot(TELEGRAM_TOKEN, DEEPSEEK_API_KEY)
+    bot = TelegramReminderBot(TELEGRAM_TOKEN, GROQ_API_KEY)
     bot.run()
