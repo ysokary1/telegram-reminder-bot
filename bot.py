@@ -6,7 +6,7 @@ from typing import Optional, List, Dict
 import sqlite3
 import re
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -534,6 +534,7 @@ class PersonalAssistantBot:
         self.app.add_handler(CommandHandler("list", self.list_command))
         self.app.add_handler(CommandHandler("projects", self.projects_command))
         self.app.add_handler(CommandHandler("done", self.done_command))
+        self.app.add_handler(CommandHandler("delete", self.delete_command))
         self.app.add_handler(CommandHandler("search", self.search_command))
         self.app.add_handler(CommandHandler("subtask", self.subtask_command))
         self.app.add_handler(CommandHandler("view", self.view_task_command))
@@ -660,6 +661,7 @@ class PersonalAssistantBot:
 /list - All active tasks
 /projects - View by project
 /done [id] - Mark complete
+/delete [id] - Delete task
 /edit [id] - Edit task
 /view [id] - View details
 /subtask [parent_id] [task] - Add subtask
@@ -728,7 +730,7 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
         
         # Response
         priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
-        response = f"{priority_emoji.get(parsed.get('priority', 'medium'), '⚪')} Task #{task_id} added\n\n"
+        response = f"{priority_emoji.get(parsed.get('priority', 'medium'), '⚪')} Task added\n\n"
         response += f"**{parsed['title']}**\n"
         
         if parsed.get('due_date'):
@@ -740,6 +742,8 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
         
         if parsed.get('labels'):
             response += f"🏷️ {parsed['labels']}\n"
+        
+        response += f"\nID: {task_id}"
         
         await update.message.reply_text(response, parse_mode='Markdown')
     
@@ -833,11 +837,11 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
         
         message = "**📁 Projects**\n\n"
         for project, project_tasks in projects.items():
-            message += f"**{project.title()}** ({len(project_tasks)})\n"
+            message += f"**{project.title()}**\n"
             for task in project_tasks[:3]:
-                message += f"  • #{task['id']} {task['title']}\n"
+                message += f"  • {task['title']} (ID: {task['id']})\n"
             if len(project_tasks) > 3:
-                message += f"  ... +{len(project_tasks) - 3}\n"
+                message += f"  ... +{len(project_tasks) - 3} more\n"
             message += "\n"
         
         await update.message.reply_text(message or "No tasks yet.", parse_mode='Markdown')
@@ -852,7 +856,7 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
         message = f"**{title}**\n\n"
         for task in tasks[:15]:
             emoji = priority_emoji.get(task['priority'], '⚪')
-            message += f"{emoji} **#{task['id']}** {task['title']}\n"
+            message += f"{emoji} {task['title']}\n"
             
             if task['due_date']:
                 due = datetime.fromisoformat(task['due_date'])
@@ -865,9 +869,9 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
             subtasks = self.db.get_subtasks(task['id'])
             if subtasks:
                 completed_sub = sum(1 for s in subtasks if s['completed'])
-                message += f"  📎 {completed_sub}/{len(subtasks)} subtasks\n"
+                message += f"  🔎 {completed_sub}/{len(subtasks)} subtasks\n"
             
-            message += "\n"
+            message += f"  ID: {task['id']}\n\n"
         
         if len(tasks) > 15:
             message += f"... and {len(tasks) - 15} more"
@@ -882,7 +886,24 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
         try:
             task_id = int(context.args[0])
             self.db.complete_task(task_id)
-            await update.message.reply_text(f"✅ Task #{task_id} completed!")
+            await update.message.reply_text(f"✅ Task completed!")
+        except ValueError:
+            await update.message.reply_text("Invalid task ID.")
+    
+    async def delete_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /delete [task_id]")
+            return
+        
+        try:
+            task_id = int(context.args[0])
+            task = self.db.get_task(task_id)
+            if not task:
+                await update.message.reply_text("Task not found.")
+                return
+            
+            self.db.delete_task(task_id)
+            await update.message.reply_text(f"🗑️ Task deleted!")
         except ValueError:
             await update.message.reply_text("Invalid task ID.")
     
@@ -911,7 +932,7 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
             
             priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
             
-            message = f"{priority_emoji.get(task['priority'], '⚪')} **Task #{task['id']}**\n\n"
+            message = f"{priority_emoji.get(task['priority'], '⚪')} **Task**\n\n"
             message += f"**{task['title']}**\n\n"
             
             if task['description']:
@@ -938,10 +959,12 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
                     status = "✅" if sub['completed'] else "⬜"
                     message += f"{status} {sub['title']}\n"
             
+            message += f"\nID: {task_id}"
+            
             keyboard = [
-                [InlineKeyboardButton("✅ Complete", callback_data=f"done_{task_id}")],
-                [InlineKeyboardButton("⏰ Snooze", callback_data=f"snooze_{task_id}")],
-                [InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{task_id}")]
+                [InlineKeyboardButton("✅ Complete", callback_data=f"done_{task_id}"),
+                 InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{task_id}")],
+                [InlineKeyboardButton("⏰ Snooze", callback_data=f"snooze_{task_id}")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -974,7 +997,7 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             await update.message.reply_text(
-                f"Editing task #{task_id}: {task['title']}\n\nWhat would you like to edit?",
+                f"Editing task: {task['title']}\n\nWhat would you like to edit?",
                 reply_markup=reply_markup
             )
             return EDIT_FIELD
@@ -1000,7 +1023,7 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
         elif field == 'project':
             self.db.update_task(task_id, project=new_value.lower())
         
-        await update.message.reply_text(f"✅ Task #{task_id} updated!")
+        await update.message.reply_text(f"✅ Task updated!")
         return ConversationHandler.END
     
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1026,7 +1049,7 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
                 parent_task_id=parent_id
             )
             
-            await update.message.reply_text(f"✅ Subtask #{subtask_id} added to task #{parent_id}")
+            await update.message.reply_text(f"✅ Subtask added\nID: {subtask_id}")
         except ValueError:
             await update.message.reply_text("Invalid parent task ID.")
     
@@ -1129,15 +1152,14 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
         try:
             keyboard = [
                 [InlineKeyboardButton("✅ Done", callback_data=f"done_{task_id}")],
-                [InlineKeyboardButton("⏰ Snooze 1h", callback_data=f"snooze1_{task_id}")],
-                [InlineKeyboardButton("⏰ Snooze 3h", callback_data=f"snooze3_{task_id}")]
+                [InlineKeyboardButton("⏰ 5 min", callback_data=f"snooze5_{task_id}"),
+                 InlineKeyboardButton("⏰ 1 hour", callback_data=f"snooze60_{task_id}")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             await self.app.bot.send_message(
                 chat_id=chat_id,
-                text=f"🔔 **REMINDER**\n\n{title}\n\nTask #{task_id}",
-                parse_mode='Markdown',
+                text=f"🔔 {title}",
                 reply_markup=reply_markup
             )
         except Exception as e:
@@ -1153,23 +1175,28 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
         if data.startswith("done_"):
             task_id = int(data.split("_")[1])
             self.db.complete_task(task_id)
-            await query.edit_message_text(f"✅ Task #{task_id} completed!")
+            await query.edit_message_text(f"✅ Task completed!")
         
-        elif data.startswith("snooze1_"):
+        elif data.startswith("delete_"):
+            task_id = int(data.split("_")[1])
+            self.db.delete_task(task_id)
+            await query.edit_message_text(f"🗑️ Task deleted!")
+        
+        elif data.startswith("snooze5_"):
+            task_id = int(data.split("_")[1])
+            task = self.db.get_task(task_id)
+            if task and task['due_date']:
+                new_due = datetime.fromisoformat(task['due_date']) + timedelta(minutes=5)
+                self.db.update_task(task_id, due_date=new_due.isoformat())
+                await query.edit_message_text(f"⏰ Snoozed 5 minutes")
+        
+        elif data.startswith("snooze60_"):
             task_id = int(data.split("_")[1])
             task = self.db.get_task(task_id)
             if task and task['due_date']:
                 new_due = datetime.fromisoformat(task['due_date']) + timedelta(hours=1)
                 self.db.update_task(task_id, due_date=new_due.isoformat())
                 await query.edit_message_text(f"⏰ Snoozed 1 hour")
-        
-        elif data.startswith("snooze3_"):
-            task_id = int(data.split("_")[1])
-            task = self.db.get_task(task_id)
-            if task and task['due_date']:
-                new_due = datetime.fromisoformat(task['due_date']) + timedelta(hours=3)
-                self.db.update_task(task_id, due_date=new_due.isoformat())
-                await query.edit_message_text(f"⏰ Snoozed 3 hours")
         
         elif data.startswith("habit_"):
             habit_id = int(data.split("_")[1])
@@ -1210,6 +1237,38 @@ Just type: "call Steve tomorrow at 3pm" or "high priority: finish report #work"
         """Start the bot"""
         self.scheduler.start()
         logger.info("Personal Assistant Bot starting...")
+        
+        # Set up command descriptions
+        async def set_commands():
+            commands = [
+                BotCommand("start", "Start the bot"),
+                BotCommand("help", "Show all commands"),
+                BotCommand("add", "Add a new task"),
+                BotCommand("today", "View today's tasks"),
+                BotCommand("tomorrow", "View tomorrow's tasks"),
+                BotCommand("week", "View this week's tasks"),
+                BotCommand("list", "View all active tasks"),
+                BotCommand("projects", "View tasks by project"),
+                BotCommand("done", "Mark task as complete"),
+                BotCommand("delete", "Delete a task"),
+                BotCommand("edit", "Edit a task"),
+                BotCommand("view", "View task details"),
+                BotCommand("search", "Search tasks"),
+                BotCommand("subtask", "Add a subtask"),
+                BotCommand("habit", "Add a habit to track"),
+                BotCommand("habits", "View all habits"),
+                BotCommand("check", "Mark habit complete"),
+                BotCommand("note", "Save a quick note"),
+                BotCommand("notes", "View all notes"),
+                BotCommand("stats", "View your productivity stats"),
+                BotCommand("briefing", "Set daily briefing times")
+            ]
+            await self.app.bot.set_my_commands(commands)
+        
+        # Run the command setup
+        import asyncio
+        asyncio.get_event_loop().run_until_complete(set_commands())
+        
         self.app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
