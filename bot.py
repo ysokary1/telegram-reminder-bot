@@ -138,7 +138,7 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            UPDATE tasks SET completed = TRUE, completed_at = %s WHERE id = %s
+            UPDATE tasks SET completed = 1, completed_at = %s WHERE id = %s
         ''', (datetime.now(ZoneInfo('Europe/London')), task_id))
         conn.commit()
         conn.close()
@@ -241,12 +241,12 @@ class Database:
             stats['tasks_completed_today'] = 0
         
         # Get active and overdue counts
-        cursor.execute('SELECT COUNT(*) as count FROM tasks WHERE user_id = %s AND completed = FALSE', (user_id,))
+        cursor.execute('SELECT COUNT(*) as count FROM tasks WHERE user_id = %s AND completed = 0', (user_id,))
         active_count = cursor.fetchone()['count']
         
         cursor.execute('''
             SELECT COUNT(*) as count FROM tasks 
-            WHERE user_id = %s AND completed = FALSE AND due_date < %s
+            WHERE user_id = %s AND completed = 0 AND due_date < %s
         ''', (user_id, datetime.now(ZoneInfo('Europe/London'))))
         overdue_count = cursor.fetchone()['count']
         
