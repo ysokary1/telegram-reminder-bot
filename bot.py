@@ -359,7 +359,7 @@ Return ONLY JSON."""
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "llama-3.1-70b-versatile",
+                        "model": "llama-3.3-70b-versatile",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": message}
@@ -488,7 +488,7 @@ Create an evening reflection. Brief and honest. Celebrate wins. If commitments w
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "llama-3.1-70b-versatile",
+                        "model": "llama-3.3-70b-versatile",
                         "messages": [
                             {"role": "system", "content": "You are a direct, performance-focused personal assistant. Brief and honest."},
                             {"role": "user", "content": context}
