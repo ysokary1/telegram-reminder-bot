@@ -582,10 +582,8 @@ class PersonalAssistantBot:
             self.handle_message
         ))
         
-        self.app.add_handler(MessageHandler(
-            filters.StatusUpdate.MESSAGE_REACTION,
-            self.handle_reaction
-        ))
+        # Reaction handler - disabled for now, needs proper implementation
+        # Will add back with MessageReactionHandler once core functionality is working
         
         # Schedule check-ins
         self.schedule_check_ins()
