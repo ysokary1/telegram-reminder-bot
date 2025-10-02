@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, MessageReactionHandler, filters, ContextTypes
 from telegram.constants import ReactionEmoji
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -398,15 +398,14 @@ class ConversationAI:
         # Build context for AI
         uk_time = datetime.now(ZoneInfo('Europe/London'))
         
-        # REWRITTEN SYSTEM PROMPT - More conversational and personable
-        system_prompt = f"""You are a direct but personable personal assistant who genuinely cares about the user's success. You're not just a task manager - you're a supportive partner who helps them win.
+        # DIALED BACK - Less questioning, more action-oriented
+        system_prompt = f"""You are a direct, efficient personal assistant. You sound human but you don't over-engage.
 
 Current time: {uk_time.strftime('%A, %B %d at %I:%M %p')}
 
 User's situation:
 - {stats['active_tasks']} active tasks ({stats['overdue_tasks']} overdue)
-- Completed {stats['completed_today']} tasks today, {stats['completed_week']} this week
-- Current streak: {stats['current_streak']} days
+- Completed {stats['completed_today']} today, {stats['completed_week']} this week
 
 Active tasks:
 {self._format_tasks_for_ai(active_tasks[:5])}
@@ -414,35 +413,34 @@ Active tasks:
 Recent conversation:
 {self._format_conversation(recent_messages)}
 
-YOUR PERSONALITY:
-- Direct and focused, but warm and encouraging
-- You ask follow-up questions when something's unclear or when you sense they need to talk through something
-- When they're crushing it, celebrate that. When they're struggling, acknowledge it honestly and help them find solutions
-- You can push them when needed - if a task has been pushed 3+ times, call it out: "This is the third time. What's actually blocking you?"
-- You're allowed to have conversations, not just manage tasks. Sometimes people need to vent or think out loud
+YOUR STYLE:
+- Direct and helpful. You do what they ask, confirm it naturally, then move on.
+- Don't ask questions unless genuinely unclear. Most of the time, just handle it.
+- When they're crushing it, quick acknowledgment ("5 tasks today - nice"). Don't overdo it.
+- When patterns emerge (task pushed 3+ times), point it out briefly: "This is the third push - what's blocking you?"
+- Sound human, but efficient. You're an assistant, not a therapist.
 
-RESPONSE STYLE:
-- For task confirmations: Be brief ("Got it - calling Steve tomorrow at 3pm")
-- For conversations: Be natural and conversational. Ask questions. Show you're listening.
-- For patterns you notice: Point them out directly ("You've completed 8 tasks today - you're on fire" or "This keeps getting pushed - let's figure out why")
-- Don't be robotic. Vary your responses. Use natural language.
+RESPONSE GUIDELINES:
+- For task actions: Brief confirmation and done. "Got it - calling Steve tomorrow at 3pm"
+- For "how's it going" type questions: Answer directly, maybe one optional follow-up IF it makes sense
+- For casual chat: Normal human response, but don't force questions into every reply
+- DEFAULT: Do the thing, confirm it, stop talking
 
-EXAMPLES OF GOOD RESPONSES:
-User: "I'm feeling overwhelmed"
-Bad: "Understood. What tasks do you need help with?"
-Good: "I hear you. Let's take a step back - what's making you feel that way? Is it the number of tasks, or is there something specific that's stressing you out?"
+BAD (too many questions):
+"Got it - calling Steve at 3pm tomorrow. Important call? What's it about? Need me to prep anything?"
 
-User: "Add call Steve tomorrow at 3"
-Bad: "Task created: Call Steve, due tomorrow 3pm"
-Good: "Got it - calling Steve tomorrow at 3pm. Important call?"
+GOOD (efficient):
+"Done - calling Steve tomorrow at 3pm"
 
-User: "I crushed 5 tasks today"
-Bad: "Good job. 5 tasks completed."
-Good: "5 tasks?! That's serious momentum. What got you into the zone today?"
+BAD (over-engaging):
+"You've got 3 tasks today. Want to talk about what's been going on and how I can help you get back on track?"
 
-Return your response as JSON:
+GOOD (direct):
+"You've got 3 tasks. The wife call is overdue - want me to remind you now?"
+
+Return JSON:
 {{
-  "reply": "your natural, conversational response",
+  "reply": "efficient, natural response",
   "actions": [
     {{"type": "create_task", "title": "...", "due_date": "ISO or null", "priority": "high/medium/low", "commitment": true/false}},
     {{"type": "complete_task", "task_id": 123}},
@@ -452,8 +450,7 @@ Return your response as JSON:
   ]
 }}
 
-Parse dates naturally. Default priority is medium. If they say "I'll do X" or "I commit to X", set commitment: true.
-Return ONLY JSON, nothing else."""
+Parse dates naturally. If they say "I'll do X", set commitment: true. Return ONLY JSON."""
 
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
@@ -469,8 +466,8 @@ Return ONLY JSON, nothing else."""
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": message}
                         ],
-                        "temperature": 0.5,  # Increased for more personality
-                        "max_tokens": 500
+                        "temperature": 0.4,
+                        "max_tokens": 400
                     }
                 )
                 
@@ -566,7 +563,7 @@ Tasks due today:
 Overdue tasks:
 {self._format_tasks_for_ai(overdue_tasks)}
 
-Create a morning check-in. Be direct but personable. If there are tasks that keep getting pushed, call it out. If they're crushing it, celebrate that. Keep it brief but make it feel human."""
+Create a morning check-in. Be direct. If there are tasks that keep getting pushed, call it out. If they're crushing it, acknowledge briefly. Keep it short - 2-3 sentences max."""
 
         else:  # evening
             completed_today = self.db.get_tasks(user_id, completed=True)
@@ -582,7 +579,7 @@ Stats: {stats['completed_week']} completed this week
 Pending tasks:
 {self._format_tasks_for_ai(today_tasks)}
 
-Create an evening reflection. Be honest about what happened today. Celebrate wins if there were any. If commitments weren't met, acknowledge it but don't be harsh. ALWAYS end with exactly: "You did good today." """
+Create an evening reflection. Brief and honest. Celebrate wins if there were any. If commitments weren't met, acknowledge it but don't be harsh. ALWAYS end with exactly: "You did good today." """
 
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -595,11 +592,11 @@ Create an evening reflection. Be honest about what happened today. Celebrate win
                     json={
                         "model": "llama-3.3-70b-versatile",
                         "messages": [
-                            {"role": "system", "content": "You are a direct, personable personal assistant who cares about the user's success. Brief but warm."},
+                            {"role": "system", "content": "You are a direct, efficient personal assistant. Brief and to the point."},
                             {"role": "user", "content": context}
                         ],
-                        "temperature": 0.7,
-                        "max_tokens": 200
+                        "temperature": 0.6,
+                        "max_tokens": 150
                     }
                 )
                 
@@ -612,7 +609,7 @@ Create an evening reflection. Be honest about what happened today. Celebrate win
         
         # Fallback
         if check_in_type == "morning":
-            return {"message": f"Morning. You have {len(today_tasks)} tasks today. Which one are you starting with?"}
+            return {"message": f"Morning. You have {len(today_tasks)} tasks today."}
         else:
             return {"message": "End of day. You did good today."}
 
@@ -665,14 +662,61 @@ class PersonalAssistantBot:
         self.ai = ConversationAI(groq_api_key, self.db)
         self.user_timezone = ZoneInfo('Europe/London')
         
-        # Handlers - simplified, conversation-first
+        # Handlers
         self.app.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND, 
             self.handle_message
         ))
         
+        # FIXED: Register reaction handler properly
+        self.app.add_handler(MessageReactionHandler(
+            self.handle_reaction
+        ))
+        
         # Schedule check-ins
         self.schedule_check_ins()
+    
+    async def reload_pending_reminders(self):
+        """Reload all pending task reminders on startup - CRITICAL FIX"""
+        logger.info("Reloading pending reminders...")
+        
+        # Get all active users
+        active_users = self.db.get_active_users()
+        
+        reloaded_count = 0
+        for user in active_users:
+            # Get all incomplete tasks with due dates for this user
+            conn = self.db.get_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            cursor.execute('''
+                SELECT id, chat_id, title, due_date 
+                FROM tasks 
+                WHERE user_id = %s 
+                AND completed = 0 
+                AND due_date IS NOT NULL
+                AND due_date > %s
+            ''', (user['user_id'], datetime.now(ZoneInfo('Europe/London'))))
+            
+            pending_tasks = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            
+            # Reschedule each one
+            for task in pending_tasks:
+                due_date = datetime.fromisoformat(str(task['due_date']))
+                if due_date.tzinfo is None:
+                    due_date = due_date.replace(tzinfo=self.user_timezone)
+                
+                await self.schedule_reminder(
+                    task['id'],
+                    due_date,
+                    task['title'],
+                    task['chat_id']
+                )
+                reloaded_count += 1
+        
+        logger.info(f"Reloaded {reloaded_count} pending reminders")
+        return reloaded_count
     
     def schedule_check_ins(self):
         """Schedule morning and evening check-ins"""
@@ -698,7 +742,7 @@ class PersonalAssistantBot:
         )
     
     async def send_morning_check_ins(self):
-        """Send morning check-in to all active users - NOW ACTUALLY WORKS"""
+        """Send morning check-in to all active users"""
         logger.info("Running morning check-ins...")
         active_users = self.db.get_active_users()
         
@@ -723,7 +767,7 @@ class PersonalAssistantBot:
             logger.error(f"Morning check-in error: {e}")
     
     async def send_evening_check_ins(self):
-        """Send evening check-in to all active users - NOW ACTUALLY WORKS"""
+        """Send evening check-in to all active users"""
         logger.info("Running evening check-ins...")
         active_users = self.db.get_active_users()
         
@@ -772,7 +816,7 @@ class PersonalAssistantBot:
         chat_id = update.effective_chat.id
         message = update.message.text
         
-        # CRITICAL: Register user activity so reminders work
+        # Register user activity
         self.db.register_user(user_id, chat_id)
         
         # Store user message
@@ -903,7 +947,7 @@ class PersonalAssistantBot:
             logger.info(f"Scheduled reminder for task {task_id} at {due_date}")
     
     async def send_task_reminder(self, chat_id: int, title: str, task_id: int):
-        """Send task reminder - NOW WORKS WITH USER MANAGEMENT"""
+        """Send task reminder"""
         try:
             message = f"⏰ {title}\n\nReact with 👍 to mark done, or tell me when to remind you again."
             
@@ -924,7 +968,10 @@ class PersonalAssistantBot:
         
         user_id = update.effective_user.id
         message_id = update.message_reaction.message_id
+        chat_id = update.message_reaction.chat.id
         reaction = update.message_reaction
+        
+        logger.info(f"Reaction detected: user {user_id}, message {message_id}")
         
         # Check if it's a completion reaction
         completion_emojis = ['👍', '✅', '✔️', '🔥']
@@ -932,6 +979,7 @@ class PersonalAssistantBot:
         if reaction.new_reaction:
             for emoji_reaction in reaction.new_reaction:
                 emoji = emoji_reaction.emoji if hasattr(emoji_reaction, 'emoji') else str(emoji_reaction)
+                logger.info(f"Emoji: {emoji}")
                 
                 if emoji in completion_emojis:
                     # Get task from message mapping
@@ -947,10 +995,16 @@ class PersonalAssistantBot:
                             confirm_msg = "🔥 Crushed it"
                         
                         await self.app.bot.send_message(
-                            chat_id=update.effective_chat.id,
+                            chat_id=chat_id,
                             text=confirm_msg
                         )
                         logger.info(f"Task {task_id} completed via reaction by user {user_id}")
+                    else:
+                        logger.warning(f"No task found for message {message_id}")
+    
+    async def post_init(self, application):
+        """Called after bot starts - reload pending reminders"""
+        await self.reload_pending_reminders()
     
     def run(self):
         """Start the bot"""
@@ -964,6 +1018,9 @@ class PersonalAssistantBot:
         logger.info(f"Evening check-ins: 8:00 PM")
         logger.info(f"Midday boost: 1:00 PM")
         logger.info("=" * 60)
+        
+        # Register post_init callback
+        self.app.post_init = self.post_init
         
         self.app.run_polling(allowed_updates=Update.ALL_TYPES)
 
