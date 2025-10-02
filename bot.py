@@ -48,10 +48,10 @@ class Database:
                 title TEXT NOT NULL,
                 due_date TIMESTAMP,
                 priority TEXT DEFAULT 'medium',
-                completed BOOLEAN DEFAULT FALSE,
+                completed INTEGER DEFAULT 0,
                 completed_at TIMESTAMP,
                 created_at TIMESTAMP NOT NULL,
-                commitment BOOLEAN DEFAULT FALSE,
+                commitment INTEGER DEFAULT 0,
                 times_pushed INTEGER DEFAULT 0,
                 job_id TEXT
             )
@@ -94,7 +94,7 @@ class Database:
             INSERT INTO tasks (user_id, chat_id, title, due_date, priority, commitment, created_at, job_id)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
-        ''', (user_id, chat_id, title, due_date, priority, commitment, 
+        ''', (user_id, chat_id, title, due_date, priority, 1 if commitment else 0, 
               datetime.now(ZoneInfo('Europe/London')), job_id))
         
         task_id = cursor.fetchone()[0]
@@ -108,7 +108,7 @@ class Database:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         query = 'SELECT * FROM tasks WHERE user_id = %s AND completed = %s'
-        params = [user_id, completed]
+        params = [user_id, 1 if completed else 0]
         
         if due_today:
             today = datetime.now(ZoneInfo('Europe/London')).date()
