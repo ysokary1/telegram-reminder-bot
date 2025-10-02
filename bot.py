@@ -321,51 +321,34 @@ class ConversationAI:
         # Build context for AI
         uk_time = datetime.now(ZoneInfo('Europe/London'))
         
-        system_prompt = f"""You are a high-performance personal assistant. Direct, focused, and action-oriented.
+        system_prompt = f"""You are a direct, high-performance personal assistant.
 
-Current time: {uk_time.strftime('%A, %B %d, %Y at %I:%M %p')}
+Current: {uk_time.strftime('%A, %B %d at %I:%M %p')}
 
-User's current situation:
-- {stats['active_tasks']} active tasks
-- {stats['overdue_tasks']} overdue tasks
-- {stats['completed_today']} completed today
-- {stats['consecutive_misses']} consecutive misses
+User has:
+- {stats['active_tasks']} active tasks ({stats['overdue_tasks']} overdue)
+- Completed {stats['completed_today']} today
 
 Active tasks:
-{self._format_tasks_for_ai(active_tasks)}
+{self._format_tasks_for_ai(active_tasks[:5])}
 
-Recent conversation:
+Recent chat:
 {self._format_conversation(recent_messages)}
 
-Your job:
-1. Understand what the user wants (add task, view tasks, mark done, general chat, etc.)
-2. Respond naturally like a competent assistant
-3. Return JSON with your reply and any actions needed
-
-Response format:
+Understand what user wants and return JSON:
 {{
-  "reply": "Your natural response to the user",
+  "reply": "brief natural response",
   "actions": [
-    {{"type": "create_task", "title": "Task title", "due_date": "ISO datetime or null", "priority": "high/medium/low", "commitment": true/false}},
+    {{"type": "create_task", "title": "...", "due_date": "ISO or null", "priority": "high/medium/low", "commitment": true/false}},
     {{"type": "complete_task", "task_id": 123}},
     {{"type": "show_tasks", "filter": "today/overdue/all"}},
     {{"type": "delete_task", "task_id": 123}},
-    {{"type": "reschedule_task", "task_id": 123, "new_due_date": "ISO datetime"}}
+    {{"type": "reschedule_task", "task_id": 123, "new_due_date": "ISO"}}
   ]
 }}
 
-Guidelines:
-- Be direct and concise
-- If they mention doing something "today" or "later", that's a commitment - set commitment: true
-- Recognize natural language: "I need to call Steve tomorrow at 3pm" -> create task
-- "Done" or "finished that" -> complete most recent task they mentioned
-- "Show me my tasks" -> show_tasks action
-- Due dates: Parse naturally. "tomorrow at 3pm" = tomorrow 3pm, "friday" = this friday 9am, "next week" = monday 9am
-- Priority: high = urgent/important/asap, medium = default, low = whenever
-- Keep replies brief - you're an assistant, not a chatbot
-- No emojis in your replies unless the user uses them
-
-Return ONLY valid JSON."""
+Be brief. Parse dates naturally. Default priority: medium. If they say "I'll do X today" set commitment: true.
+Return ONLY JSON."""
 
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
@@ -387,7 +370,8 @@ Return ONLY valid JSON."""
                 )
                 
                 if response.status_code != 200:
-                    logger.error(f"AI API error: {response.status_code}")
+                    error_detail = response.text
+                    logger.error(f"AI API error: {response.status_code} - {error_detail}")
                     return {
                         "reply": "Sorry, I'm having trouble processing that. Can you try again?",
                         "actions": []
