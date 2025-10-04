@@ -455,7 +455,8 @@ Return ONLY JSON with "reply" and "actions" keys.
                             {"role": "user", "content": message}
                         ],
                         "temperature": 0.4,
-                        "max_tokens": 400
+                        "max_tokens": 400,
+                        "response_format": {"type": "json_object"}
                     }
                 )
                 
@@ -469,15 +470,21 @@ Return ONLY JSON with "reply" and "actions" keys.
                 
                 content = response.json()['choices'][0]['message']['content'].strip()
                 
-                # Clean up markdown formatting if present
-                if content.startswith('```'):
-                    content = content.split('```')[1]
-                    if content.startswith('json'):
-                        content = content[4:]
-                    content = content.strip()
+                # The AI sometimes adds conversational text before the JSON, even with JSON mode.
+                # This robustly extracts the JSON object from the response string.
+                json_start = content.find('{')
+                json_end = content.rfind('}') + 1
                 
-                result = json.loads(content)
-                
+                if json_start != -1 and json_end > json_start:
+                    json_string = content[json_start:json_end]
+                    result = json.loads(json_string)
+                else:
+                    logger.error(f"No JSON object found in AI response: {content}")
+                    return {
+                        "reply": content if content else "Sorry, I couldn't process that. Please try again.",
+                        "actions": []
+                    }
+
                 # Ensure actions is a list
                 if 'actions' not in result:
                     result['actions'] = []
@@ -485,7 +492,10 @@ Return ONLY JSON with "reply" and "actions" keys.
                 return result
                 
         except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error: {e}, content: {content}")
+            raw_content = "Content not available"
+            if 'content' in locals():
+                raw_content = content
+            logger.error(f"JSON decode error: {e}, content: {raw_content}")
             return {
                 "reply": "I understood you, but had a technical hiccup. Mind rephrasing that?",
                 "actions": []
@@ -1025,3 +1035,4 @@ if __name__ == "__main__":
     
     bot = PersonalAssistantBot(TELEGRAM_TOKEN, GROQ_API_KEY)
     bot.run()
+
