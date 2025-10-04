@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, MessageReactionHandler, filters, ContextTypes
 from telegram.constants import ReactionEmoji
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -81,8 +81,64 @@ class Database:
             )
         ''')
         
+        # Active users table - CRITICAL FIX for reminders
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS active_users (
+                user_id BIGINT PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                last_interaction TIMESTAMP NOT NULL,
+                first_seen TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        ''')
+        
+        # Message-to-task mapping for reaction-based completion
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS message_task_map (
+                message_id BIGINT PRIMARY KEY,
+                task_id INTEGER NOT NULL,
+                chat_id BIGINT NOT NULL,
+                created_at TIMESTAMP NOT NULL
+            )
+        ''')
+        
         conn.commit()
         conn.close()
+    
+    def register_user(self, user_id: int, chat_id: int):
+        """Register or update user activity - CRITICAL for reminders to work"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        now = datetime.now(ZoneInfo('Europe/London'))
+        
+        cursor.execute('''
+            INSERT INTO active_users (user_id, chat_id, last_interaction, first_seen)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id) 
+            DO UPDATE SET 
+                chat_id = EXCLUDED.chat_id, 
+                last_interaction = EXCLUDED.last_interaction
+        ''', (user_id, chat_id, now, now))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_active_users(self) -> List[Dict]:
+        """Get all active users for scheduled check-ins"""
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Get users who've interacted in the last 7 days
+        cutoff = datetime.now(ZoneInfo('Europe/London')) - timedelta(days=7)
+        cursor.execute('''
+            SELECT user_id, chat_id, last_interaction 
+            FROM active_users 
+            WHERE last_interaction > %s
+            ORDER BY last_interaction DESC
+        ''', (cutoff,))
+        
+        results = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return results
     
     def add_task(self, user_id: int, chat_id: int, title: str, 
                  due_date: str = None, priority: str = 'medium', 
@@ -172,6 +228,27 @@ class Database:
         cursor.execute('UPDATE tasks SET times_pushed = times_pushed + 1 WHERE id = %s', (task_id,))
         conn.commit()
         conn.close()
+    
+    def store_message_task_map(self, message_id: int, task_id: int, chat_id: int):
+        """Store mapping between message and task for reaction-based completion"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO message_task_map (message_id, task_id, chat_id, created_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (message_id) DO UPDATE SET task_id = EXCLUDED.task_id
+        ''', (message_id, task_id, chat_id, datetime.now(ZoneInfo('Europe/London'))))
+        conn.commit()
+        conn.close()
+    
+    def get_task_from_message(self, message_id: int) -> Optional[int]:
+        """Get task_id from message_id"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT task_id FROM message_task_map WHERE message_id = %s', (message_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
     
     # Conversation history
     def add_message(self, user_id: int, role: str, message: str):
@@ -321,6 +398,7 @@ class ConversationAI:
         # Build context for AI
         uk_time = datetime.now(ZoneInfo('Europe/London'))
         
+        # --- FIXED PROMPT ---
         system_prompt = f"""You are a personal assistant with a direct but personable and encouraging tone. You care about the user's success. Your goal is to help them stay on track while being supportive. You sound like a real person.
 
 Current time: {uk_time.strftime('%A, %B %d at %I:%M %p')}
@@ -362,9 +440,6 @@ Return ONLY JSON with "reply" and "actions" keys.
   ]
 }}"""
 
-Be brief. Parse dates naturally. Default priority: medium. If they say "I'll do X today" set commitment: true.
-Return ONLY JSON."""
-
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.post(
@@ -379,8 +454,8 @@ Return ONLY JSON."""
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": message}
                         ],
-                        "temperature": 0.3,
-                        "max_tokens": 500
+                        "temperature": 0.4,
+                        "max_tokens": 400
                     }
                 )
                 
@@ -412,13 +487,13 @@ Return ONLY JSON."""
         except json.JSONDecodeError as e:
             logger.error(f"JSON decode error: {e}, content: {content}")
             return {
-                "reply": "I understood you, but had a technical issue. Try rephrasing?",
+                "reply": "I understood you, but had a technical hiccup. Mind rephrasing that?",
                 "actions": []
             }
         except Exception as e:
             logger.error(f"AI error: {e}")
             return {
-                "reply": "Had a glitch there. Try again?",
+                "reply": "Hit a snag there. Try again?",
                 "actions": []
             }
     
@@ -447,9 +522,9 @@ Return ONLY JSON."""
             formatted.append(f"{msg['role']}: {msg['message']}")
         return "\n".join(formatted)
     
+    # --- FIXED SYNTAX ERROR ---
     async def generate_check_in(self, user_id: int, check_in_type: str) -> Dict:
         """Generate proactive check-in message"""
-        
         tasks = self.db.get_tasks(user_id, completed=False)
         stats = self.db.get_stats(user_id)
         uk_time = datetime.now(ZoneInfo('Europe/London'))
@@ -476,7 +551,7 @@ Tasks due today:
 Overdue tasks:
 {self._format_tasks_for_ai(overdue_tasks)}
 
-Create a morning check-in. Be direct and focused. If there are overdue tasks that keep getting pushed, call it out. If they're crushing it, acknowledge it. Keep it brief."""
+Create a morning check-in. Be direct. If there are tasks that keep getting pushed, call it out. If they're crushing it, acknowledge briefly. Keep it short - 2-3 sentences max."""
 
         else:  # evening
             completed_today = self.db.get_tasks(user_id, completed=True)
@@ -492,7 +567,7 @@ Stats: {stats['completed_week']} completed this week
 Pending tasks:
 {self._format_tasks_for_ai(today_tasks)}
 
-Create an evening reflection. Brief and honest. Celebrate wins. If commitments weren't met, ask what happened. Always end with: "You did good today." """
+Create an evening reflection. Brief and honest. Celebrate wins if there were any. If commitments weren't met, acknowledge it but don't be harsh. ALWAYS end with exactly: "You did good today." """
 
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -505,11 +580,11 @@ Create an evening reflection. Brief and honest. Celebrate wins. If commitments w
                     json={
                         "model": "llama-3.3-70b-versatile",
                         "messages": [
-                            {"role": "system", "content": "You are a direct, performance-focused personal assistant. Brief and honest."},
+                            {"role": "system", "content": "You are a direct, efficient personal assistant. Brief and to the point."},
                             {"role": "user", "content": context}
                         ],
-                        "temperature": 0.7,
-                        "max_tokens": 200
+                        "temperature": 0.6,
+                        "max_tokens": 150
                     }
                 )
                 
@@ -522,7 +597,7 @@ Create an evening reflection. Brief and honest. Celebrate wins. If commitments w
         
         # Fallback
         if check_in_type == "morning":
-            return {"message": f"Morning. You have {len(today_tasks)} tasks today. Which one are you starting with?"}
+            return {"message": f"Morning. You have {len(today_tasks)} tasks today."}
         else:
             return {"message": "End of day. You did good today."}
 
@@ -575,17 +650,61 @@ class PersonalAssistantBot:
         self.ai = ConversationAI(groq_api_key, self.db)
         self.user_timezone = ZoneInfo('Europe/London')
         
-        # Handlers - simplified, conversation-first
+        # Handlers
         self.app.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND, 
             self.handle_message
         ))
         
-        # Reaction handler - disabled for now, needs proper implementation
-        # Will add back with MessageReactionHandler once core functionality is working
+        # FIXED: Register reaction handler properly
+        self.app.add_handler(MessageReactionHandler(
+            self.handle_reaction
+        ))
         
         # Schedule check-ins
         self.schedule_check_ins()
+    
+    async def reload_pending_reminders(self):
+        """Reload all pending task reminders on startup - CRITICAL FIX"""
+        logger.info("Reloading pending reminders...")
+        
+        # Get all active users
+        active_users = self.db.get_active_users()
+        
+        reloaded_count = 0
+        for user in active_users:
+            # Get all incomplete tasks with due dates for this user
+            conn = self.db.get_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            cursor.execute('''
+                SELECT id, chat_id, title, due_date 
+                FROM tasks 
+                WHERE user_id = %s 
+                AND completed = 0 
+                AND due_date IS NOT NULL
+                AND due_date > %s
+            ''', (user['user_id'], datetime.now(ZoneInfo('Europe/London'))))
+            
+            pending_tasks = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            
+            # Reschedule each one
+            for task in pending_tasks:
+                due_date = datetime.fromisoformat(str(task['due_date']))
+                if due_date.tzinfo is None:
+                    due_date = due_date.replace(tzinfo=self.user_timezone)
+                
+                await self.schedule_reminder(
+                    task['id'],
+                    due_date,
+                    task['title'],
+                    task['chat_id']
+                )
+                reloaded_count += 1
+        
+        logger.info(f"Reloaded {reloaded_count} pending reminders")
+        return reloaded_count
     
     def schedule_check_ins(self):
         """Schedule morning and evening check-ins"""
@@ -611,10 +730,16 @@ class PersonalAssistantBot:
         )
     
     async def send_morning_check_ins(self):
-        """Send morning check-in to all users"""
-        # In production, iterate through all users
-        # For now, this will be triggered but needs user management
-        pass
+        """Send morning check-in to all active users"""
+        logger.info("Running morning check-ins...")
+        active_users = self.db.get_active_users()
+        
+        for user in active_users:
+            try:
+                await self.send_morning_check_in(user['chat_id'], user['user_id'])
+                logger.info(f"Sent morning check-in to user {user['user_id']}")
+            except Exception as e:
+                logger.error(f"Failed to send morning check-in to user {user['user_id']}: {e}")
     
     async def send_morning_check_in(self, chat_id: int, user_id: int):
         """Send morning check-in to specific user"""
@@ -623,15 +748,23 @@ class PersonalAssistantBot:
             
             # Add motivational quote
             quote = MotivationEngine.get_random_quote()
-            message = f"{result['message']}\n\n{quote}"
+            message = f"{result['message']}\n\n💪 {quote}"
             
             await self.app.bot.send_message(chat_id=chat_id, text=message)
         except Exception as e:
             logger.error(f"Morning check-in error: {e}")
     
     async def send_evening_check_ins(self):
-        """Send evening check-in to all users"""
-        pass
+        """Send evening check-in to all active users"""
+        logger.info("Running evening check-ins...")
+        active_users = self.db.get_active_users()
+        
+        for user in active_users:
+            try:
+                await self.send_evening_check_in(user['chat_id'], user['user_id'])
+                logger.info(f"Sent evening check-in to user {user['user_id']}")
+            except Exception as e:
+                logger.error(f"Failed to send evening check-in to user {user['user_id']}: {e}")
     
     async def send_evening_check_in(self, chat_id: int, user_id: int):
         """Send evening check-in to specific user"""
@@ -642,9 +775,15 @@ class PersonalAssistantBot:
             logger.error(f"Evening check-in error: {e}")
     
     async def send_midday_boost(self):
-        """Send midday motivation"""
-        # Would iterate through users
-        pass
+        """Send midday motivation to active users who need it"""
+        logger.info("Running midday boost check...")
+        active_users = self.db.get_active_users()
+        
+        for user in active_users:
+            try:
+                await self.send_midday_motivation(user['chat_id'], user['user_id'])
+            except Exception as e:
+                logger.error(f"Failed to send midday boost to user {user['user_id']}: {e}")
     
     async def send_midday_motivation(self, chat_id: int, user_id: int):
         """Send midday motivation to specific user"""
@@ -655,6 +794,7 @@ class PersonalAssistantBot:
             if stats['consecutive_misses'] >= 2 or stats['completed_today'] >= 3:
                 message = MotivationEngine.get_personalized_motivation(stats)
                 await self.app.bot.send_message(chat_id=chat_id, text=message)
+                logger.info(f"Sent midday boost to user {user_id}")
         except Exception as e:
             logger.error(f"Midday boost error: {e}")
     
@@ -663,6 +803,9 @@ class PersonalAssistantBot:
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         message = update.message.text
+        
+        # Register user activity
+        self.db.register_user(user_id, chat_id)
         
         # Store user message
         self.db.add_message(user_id, "user", message)
@@ -688,12 +831,13 @@ class PersonalAssistantBot:
         
         sent_message = await update.message.reply_text(reply)
         
-        # Store message ID for reaction handling if it's about a specific task
-        if action_results:
-            context.bot_data[f'last_message_{user_id}'] = {
-                'message_id': sent_message.message_id,
-                'task_id': action_results[0].get('task_id') if action_results else None
-            }
+        # Store message-task mapping for reaction handling
+        if action_results and 'task_id' in action_results[0]:
+            self.db.store_message_task_map(
+                sent_message.message_id, 
+                action_results[0]['task_id'], 
+                chat_id
+            )
     
     async def execute_action(self, user_id: int, chat_id: int, action: Dict) -> Optional[Dict]:
         """Execute action returned by AI"""
@@ -788,19 +932,22 @@ class PersonalAssistantBot:
             )
             
             self.db.update_task(task_id, job_id=job_id)
+            logger.info(f"Scheduled reminder for task {task_id} at {due_date}")
     
     async def send_task_reminder(self, chat_id: int, title: str, task_id: int):
         """Send task reminder"""
         try:
-            message = f"â° {title}\n\nReact with ðŸ‘ to mark done, or tell me when to remind you again."
+            message = f"⏰ {title}\n\nReact with 👍 to mark done, or tell me when to remind you again."
             
             sent_message = await self.app.bot.send_message(chat_id=chat_id, text=message)
             
-            # Store for reaction handling
-            # Note: This is simplified - in production you'd need persistent storage
+            # Store message-task mapping for reaction handling
+            self.db.store_message_task_map(sent_message.message_id, task_id, chat_id)
+            
+            logger.info(f"Sent reminder for task {task_id} to chat {chat_id}")
             
         except Exception as e:
-            logger.error(f"Reminder error: {e}")
+            logger.error(f"Reminder error for task {task_id}: {e}")
     
     async def handle_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle message reactions for task completion"""
@@ -808,42 +955,60 @@ class PersonalAssistantBot:
             return
         
         user_id = update.effective_user.id
+        message_id = update.message_reaction.message_id
+        chat_id = update.message_reaction.chat.id
         reaction = update.message_reaction
         
+        logger.info(f"Reaction detected: user {user_id}, message {message_id}")
+        
         # Check if it's a completion reaction
-        completion_emojis = ['ðŸ‘', 'âœ…', 'âœ”ï¸', 'ðŸ”¥']
+        completion_emojis = ['👍', '✅', '✔️', '🔥']
         
         if reaction.new_reaction:
             for emoji_reaction in reaction.new_reaction:
                 emoji = emoji_reaction.emoji if hasattr(emoji_reaction, 'emoji') else str(emoji_reaction)
+                logger.info(f"Emoji: {emoji}")
                 
                 if emoji in completion_emojis:
-                    # Try to find the task associated with this message
-                    # This is simplified - in production you'd store message_id -> task_id mapping
-                    recent_tasks = self.db.get_tasks(user_id, completed=False)
+                    # Get task from message mapping
+                    task_id = self.db.get_task_from_message(message_id)
                     
-                    if recent_tasks:
-                        # Complete the most recent task
-                        task = recent_tasks[0]
-                        self.db.complete_task(task['id'])
+                    if task_id:
+                        self.db.complete_task(task_id)
                         self.db.record_completion(user_id)
                         
                         # Send confirmation
-                        confirm_msg = "âœ… Marked complete"
-                        if emoji == 'ðŸ”¥':
-                            confirm_msg = "ðŸ”¥ Crushed it"
+                        confirm_msg = "✅ Marked complete"
+                        if emoji == '🔥':
+                            confirm_msg = "🔥 Crushed it"
                         
                         await self.app.bot.send_message(
-                            chat_id=update.effective_chat.id,
+                            chat_id=chat_id,
                             text=confirm_msg
                         )
+                        logger.info(f"Task {task_id} completed via reaction by user {user_id}")
+                    else:
+                        logger.warning(f"No task found for message {message_id}")
+    
+    async def post_init(self, application):
+        """Called after bot starts - reload pending reminders"""
+        await self.reload_pending_reminders()
     
     def run(self):
         """Start the bot"""
         self.scheduler.start()
-        logger.info("Conversation-first PA Bot starting...")
+        logger.info("=" * 60)
+        logger.info("Personal Assistant Bot Starting")
+        logger.info("=" * 60)
         logger.info(f"Timezone: Europe/London")
         logger.info(f"Current time: {datetime.now(self.user_timezone)}")
+        logger.info(f"Morning check-ins: 7:30 AM")
+        logger.info(f"Evening check-ins: 8:00 PM")
+        logger.info(f"Midday boost: 1:00 PM")
+        logger.info("=" * 60)
+        
+        # Register post_init callback
+        self.app.post_init = self.post_init
         
         self.app.run_polling(allowed_updates=Update.ALL_TYPES)
 
@@ -851,9 +1016,11 @@ class PersonalAssistantBot:
 if __name__ == "__main__":
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
     GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+    DATABASE_URL = os.environ.get("DATABASE_URL")
     
-    if not TELEGRAM_TOKEN or not GROQ_API_KEY:
+    if not TELEGRAM_TOKEN or not GROQ_API_KEY or not DATABASE_URL:
         logger.error("Missing environment variables!")
+        logger.error("Required: TELEGRAM_BOT_TOKEN, GROQ_API_KEY, DATABASE_URL")
         exit(1)
     
     bot = PersonalAssistantBot(TELEGRAM_TOKEN, GROQ_API_KEY)
