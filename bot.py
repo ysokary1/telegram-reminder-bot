@@ -562,7 +562,11 @@ class PersonalAssistantBot:
             pending_tasks = self.db.get_tasks(user['user_id'], completed=False)
             for task in pending_tasks:
                 if task['due_date']:
-                    due_date = datetime.fromisoformat(str(task['due_date']))
+                    # FIX: Make the due_date timezone-aware before comparison
+                    due_date = task['due_date']
+                    if due_date.tzinfo is None:
+                        due_date = due_date.replace(tzinfo=self.user_timezone)
+                    
                     if due_date > datetime.now(self.user_timezone):
                         await self.schedule_reminder(task['id'], due_date, task['title'], task['chat_id'])
                         reloaded_count += 1
