@@ -390,15 +390,9 @@ class ConversationAI:
     async def process_message(self, user_id: int, chat_id: int, message: str) -> Dict:
         """Process user message and return response + actions"""
         
-        # Get context
-        recent_messages = self.db.get_recent_messages(user_id, limit=6)
         active_tasks = self.db.get_tasks(user_id, completed=False)
-        stats = self.db.get_stats(user_id)
-        
-        # Build context for AI
         uk_time = datetime.now(ZoneInfo('Europe/London'))
         
-        # --- FIXED PROMPT V3 ---
         system_prompt = f"""You are a personal assistant. Your tone is natural, supportive, and efficient. You sound like a real person, not a hyper-enthusiastic bot.
 
 Current time: {uk_time.isoformat()}
@@ -407,7 +401,7 @@ Active tasks:
 {self._format_tasks_for_ai(active_tasks)}
 
 YOUR STYLE AND RULES:
-- **Source of Truth:** The 'Active tasks' list above is the ONLY source of truth for what is pending. Base your replies ONLY on this list. Do NOT infer task status from the conversation history. If the list is empty, there are no active tasks.
+- **Source of Truth:** The 'Active tasks' list above is the ONLY source of truth for what is pending. Base your replies ONLY on this list. Do NOT infer task status from conversation history. If the list is empty, there are no active tasks.
 - **Natural & Supportive:** Be personable and direct. Your goal is to help, not to distract.
 - **Task Confirmation:** For simple task actions, be brief. "Got it, added 'Call Steve tomorrow'." or "Done."
 - **Handle Dates Correctly:** When a due date is relative (e.g., 'in 2 minutes', 'tomorrow at 3pm'), you MUST calculate the exact ISO 8601 timestamp based on the current time and include it in the 'due_date' field.
@@ -448,182 +442,92 @@ Return ONLY JSON with "reply" and "actions" keys.
                 if response.status_code != 200:
                     error_detail = response.text
                     logger.error(f"AI API error: {response.status_code} - {error_detail}")
-                    return {
-                        "reply": "Sorry, I'm having trouble processing that. Can you try again?",
-                        "actions": []
-                    }
+                    return {"reply": "Sorry, I'm having trouble. Can you try again?", "actions": []}
                 
                 content = response.json()['choices'][0]['message']['content'].strip()
-                
                 json_start = content.find('{')
                 json_end = content.rfind('}') + 1
                 
                 if json_start != -1 and json_end > json_start:
-                    json_string = content[json_start:json_end]
-                    result = json.loads(json_string)
+                    result = json.loads(content[json_start:json_end])
                 else:
-                    logger.error(f"No JSON object found in AI response: {content}")
-                    return {
-                        "reply": content if content else "Sorry, I couldn't process that. Please try again.",
-                        "actions": []
-                    }
+                    return {"reply": content if content else "Sorry, couldn't process that.", "actions": []}
 
                 if 'actions' not in result:
                     result['actions'] = []
                 
                 return result
                 
-        except json.JSONDecodeError as e:
-            raw_content = "Content not available"
-            if 'content' in locals():
-                raw_content = content
-            logger.error(f"JSON decode error: {e}, content: {raw_content}")
-            return {
-                "reply": "I understood you, but had a technical hiccup. Mind rephrasing that?",
-                "actions": []
-            }
         except Exception as e:
-            logger.error(f"AI error: {e}")
-            return {
-                "reply": "Hit a snag there. Try again?",
-                "actions": []
-            }
+            logger.error(f"AI processing error: {e}")
+            return {"reply": "Hit a snag there. Try again?", "actions": []}
     
     def _format_tasks_for_ai(self, tasks: List[Dict]) -> str:
         if not tasks:
             return "No active tasks"
         
-        formatted = []
-        for task in tasks[:10]:
-            due_str = ""
-            if task['due_date']:
-                due = datetime.fromisoformat(str(task['due_date']))
-                due_str = f" (due {due.strftime('%b %d at %I:%M%p')})"
-            
-            pushed = f" [pushed {task['times_pushed']}x]" if task['times_pushed'] > 0 else ""
-            formatted.append(f"- ID {task['id']}: {task['title']}{due_str}{pushed}")
-        
-        return "\n".join(formatted)
-    
-    def _format_conversation(self, messages: List[Dict]) -> str:
-        if not messages:
-            return "No recent conversation"
-        
-        formatted = []
-        for msg in messages[-6:]:
-            formatted.append(f"{msg['role']}: {msg['message']}")
+        formatted = [f"- ID {task['id']}: {task['title']}" for task in tasks[:10]]
         return "\n".join(formatted)
     
     async def generate_check_in(self, user_id: int, check_in_type: str) -> Dict:
         """Generate proactive check-in message"""
         tasks = self.db.get_tasks(user_id, completed=False)
-        stats = self.db.get_stats(user_id)
         uk_time = datetime.now(ZoneInfo('Europe/London'))
         
-        today_tasks = self.db.get_tasks(user_id, completed=False, due_today=True)
-        overdue_tasks = self.db.get_tasks(user_id, completed=False, overdue=True)
-        
         if check_in_type == "morning":
-            context = f"""Generate a morning check-in message.
-
-Current time: {uk_time.strftime('%A, %B %d at %I:%M %p')}
-
-Stats:
-- {len(tasks)} active tasks total
-- {len(today_tasks)} due today
-- {len(overdue_tasks)} overdue
-
-Tasks due today:
-{self._format_tasks_for_ai(today_tasks)}
-
-Overdue tasks:
-{self._format_tasks_for_ai(overdue_tasks)}
-
-Create a morning check-in. Be direct. If there are tasks that keep getting pushed, call it out. If they're crushing it, acknowledge briefly. Keep it short - 2-3 sentences max."""
-
+            context = f"Generate a brief, direct morning check-in. It's {uk_time.strftime('%A morning')}. Here are the user's tasks:\n{self._format_tasks_for_ai(tasks)}"
         else:  # evening
             completed_today = self.db.get_tasks(user_id, completed=True)
             completed_today = [t for t in completed_today if t['completed_at'] and 
                              datetime.fromisoformat(str(t['completed_at'])).date() == uk_time.date()]
-            
-            context = f"""Generate an evening check-in.
-
-Today's completion: {len(completed_today)} tasks completed
-Still pending: {len(today_tasks)} tasks due today not completed
-
-Pending tasks:
-{self._format_tasks_for_ai(today_tasks)}
-
-Create an evening reflection. Brief and honest. Celebrate wins if there were any. If commitments weren't met, acknowledge it but don't be harsh. ALWAYS end with exactly: "You did good today." """
+            context = f"Generate a brief evening reflection. User completed {len(completed_today)} tasks. Pending tasks:\n{self._format_tasks_for_ai(tasks)}"
 
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.post(
-                    self.base_url,
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": "llama-3.3-70b-versatile",
-                        "messages": [
-                            {"role": "system", "content": "You are a direct, efficient personal assistant. Brief and to the point."},
-                            {"role": "user", "content": context}
-                        ],
-                        "temperature": 0.6,
-                        "max_tokens": 150
-                    }
+                    self.base_url, headers={"Authorization": f"Bearer {self.api_key}"},
+                    json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "system", "content": "You are a direct, efficient personal assistant. Brief and to the point."}, {"role": "user", "content": context}], "temperature": 0.6, "max_tokens": 150}
                 )
-                
                 if response.status_code == 200:
-                    message = response.json()['choices'][0]['message']['content'].strip()
-                    return {"message": message}
-                
+                    return {"message": response.json()['choices'][0]['message']['content'].strip()}
         except Exception as e:
             logger.error(f"Check-in generation error: {e}")
         
-        if check_in_type == "morning":
-            return {"message": f"Morning. You have {len(today_tasks)} tasks today."}
-        else:
-            return {"message": "End of day. You did good today."}
+        return {"message": "Just checking in."}
 
 
 class MotivationEngine:
-    """Handles motivational messages"""
-    
+    """Handles AI-powered motivational messages"""
     USER_QUOTES = [
-        "I am the most important project I will ever work on. So just go and do it.",
+        "You are the most important project you will ever work on. So just go and do it.",
         "Your future family is depending on the man you are becoming today. Do it tired, sad, heartbroken, unmotivated, scared, lonely. Do it for them.",
-        "I WIN I WIN THATS MY JOB THATS WHAT I DO",
-        "No matter what life throws at you. You are unstoppable. No matter how rough it gets I will not quit. No matter how worn out I am I will not stop. Give it your best shot but I am unstoppable.",
-        "I will sacrifice what others wont, and endure what others wont. There's a price relationships strain people wont understand I will miss things I wont get back but its all worth it at the end."
+        "I WIN I WIN THATS MY JOB THATS WHAT I DO.",
+        "No matter what life throws at you, you are unstoppable. No matter how rough it gets, I will not quit. No matter how worn out I am, I will not stop. Give it your best shot, but I am unstoppable.",
+        "I will sacrifice what others wont, and endure what others wont. There's a price. Relationships strain, people wont understand. I will miss things I wont get back, but its all worth it at the end."
     ]
-    
-    @staticmethod
-    def get_random_quote() -> str:
-        return random.choice(MotivationEngine.USER_QUOTES)
-    
-    @staticmethod
-    def get_personalized_motivation(stats: Dict) -> str:
-        """Generate motivation based on user's actual performance"""
-        messages = []
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.groq.com/openai/v1/chat/completions"
+
+    def get_random_user_quote(self) -> str:
+        return random.choice(self.USER_QUOTES)
+
+    async def get_ai_generated_quote(self) -> str:
+        """Generates a motivational quote using an AI, with a fallback."""
+        try:
+            prompt = f"Generate a short, powerful motivational quote. Be original. The theme should be similar to these examples:\n\n- {self.USER_QUOTES[0]}\n- {self.USER_QUOTES[1]}\n- {self.USER_QUOTES[3]}"
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    self.base_url, headers={"Authorization": f"Bearer {self.api_key}"},
+                    json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "system", "content": "You are a motivational coach. Provide only the quote, no extra text."}, {"role": "user", "content": prompt}], "temperature": 0.8, "max_tokens": 60}
+                )
+                if response.status_code == 200:
+                    return response.json()['choices'][0]['message']['content'].strip().strip('"')
+        except Exception as e:
+            logger.error(f"AI quote generation failed: {e}")
         
-        if stats['completed_today'] >= 5:
-            messages.append(f"You've crushed {stats['completed_today']} tasks today. That's momentum.")
-        
-        if stats['completed_week'] >= 20:
-            messages.append(f"{stats['completed_week']} tasks this week. You're executing.")
-        
-        if stats['current_streak'] >= 3:
-            messages.append(f"{stats['current_streak']} day streak. Keep that energy.")
-        
-        if stats['overdue_tasks'] == 0 and stats['active_tasks'] > 0:
-            messages.append("Nothing overdue. You're on top of it.")
-        
-        if messages:
-            return random.choice(messages)
-        
-        return MotivationEngine.get_random_quote()
+        return self.get_random_user_quote()
 
 
 class PersonalAssistantBot:
@@ -634,315 +538,164 @@ class PersonalAssistantBot:
         self.scheduler = AsyncIOScheduler(timezone='Europe/London')
         self.db = Database()
         self.ai = ConversationAI(groq_api_key, self.db)
+        self.motivation = MotivationEngine(groq_api_key)
         self.user_timezone = ZoneInfo('Europe/London')
         
-        self.app.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND, 
-            self.handle_message
-        ))
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        self.app.add_handler(MessageReactionHandler(self.handle_reaction))
         
-        self.app.add_handler(MessageReactionHandler(
-            self.handle_reaction
-        ))
-        
-        self.schedule_check_ins()
+        self.schedule_jobs()
     
+    def schedule_jobs(self):
+        """Schedules all recurring jobs for the bot."""
+        self.scheduler.add_job(self.send_morning_check_ins, trigger=CronTrigger(hour=7, minute=30), id='morning_check')
+        self.scheduler.add_job(self.send_evening_check_ins, trigger=CronTrigger(hour=20, minute=0), id='evening_check')
+        self.scheduler.add_job(self.send_random_check_ins, trigger=CronTrigger(hour='9-18', minute=0, jitter=1800), id='random_check') # Every hour 9-6, with 30min jitter
+        logger.info("Scheduled jobs: Morning, Evening, and Random hourly check-ins.")
+
     async def reload_pending_reminders(self):
-        """Reload all pending task reminders on startup - CRITICAL FIX"""
+        """Reload all pending task reminders on startup"""
         logger.info("Reloading pending reminders...")
-        
         active_users = self.db.get_active_users()
-        
         reloaded_count = 0
         for user in active_users:
-            conn = self.db.get_connection()
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
-            
-            cursor.execute('''
-                SELECT id, chat_id, title, due_date 
-                FROM tasks 
-                WHERE user_id = %s 
-                AND completed = 0 
-                AND due_date IS NOT NULL
-                AND due_date > %s
-            ''', (user['user_id'], datetime.now(ZoneInfo('Europe/London'))))
-            
-            pending_tasks = [dict(row) for row in cursor.fetchall()]
-            conn.close()
-            
+            pending_tasks = self.db.get_tasks(user['user_id'], completed=False)
             for task in pending_tasks:
-                due_date = datetime.fromisoformat(str(task['due_date']))
-                if due_date.tzinfo is None:
-                    due_date = due_date.replace(tzinfo=self.user_timezone)
-                
-                await self.schedule_reminder(
-                    task['id'],
-                    due_date,
-                    task['title'],
-                    task['chat_id']
-                )
-                reloaded_count += 1
-        
+                if task['due_date']:
+                    due_date = datetime.fromisoformat(str(task['due_date']))
+                    if due_date > datetime.now(self.user_timezone):
+                        await self.schedule_reminder(task['id'], due_date, task['title'], task['chat_id'])
+                        reloaded_count += 1
         logger.info(f"Reloaded {reloaded_count} pending reminders")
-        return reloaded_count
-    
-    def schedule_check_ins(self):
-        """Schedule morning and evening check-ins"""
-        self.scheduler.add_job(
-            self.send_morning_check_ins,
-            trigger=CronTrigger(hour=7, minute=30),
-            id='morning_check'
-        )
-        
-        self.scheduler.add_job(
-            self.send_evening_check_ins,
-            trigger=CronTrigger(hour=20, minute=0),
-            id='evening_check'
-        )
-        
-        self.scheduler.add_job(
-            self.send_midday_boost,
-            trigger=CronTrigger(hour=13, minute=0),
-            id='midday_boost'
-        )
-    
+
     async def send_morning_check_ins(self):
         """Send morning check-in to all active users"""
-        logger.info("Running morning check-ins...")
-        active_users = self.db.get_active_users()
-        
-        for user in active_users:
+        for user in self.db.get_active_users():
             try:
-                await self.send_morning_check_in(user['chat_id'], user['user_id'])
-                logger.info(f"Sent morning check-in to user {user['user_id']}")
+                result = await self.ai.generate_check_in(user['user_id'], "morning")
+                quote = await self.motivation.get_ai_generated_quote()
+                message = f"{result['message']}\n\n{quote}"
+                await self.app.bot.send_message(chat_id=user['chat_id'], text=message)
             except Exception as e:
                 logger.error(f"Failed to send morning check-in to user {user['user_id']}: {e}")
-    
-    async def send_morning_check_in(self, chat_id: int, user_id: int):
-        """Send morning check-in to specific user"""
-        try:
-            result = await self.ai.generate_check_in(user_id, "morning")
-            
-            quote = MotivationEngine.get_random_quote()
-            message = f"{result['message']}\n\n💪 {quote}"
-            
-            await self.app.bot.send_message(chat_id=chat_id, text=message)
-        except Exception as e:
-            logger.error(f"Morning check-in error: {e}")
-    
+
     async def send_evening_check_ins(self):
         """Send evening check-in to all active users"""
-        logger.info("Running evening check-ins...")
-        active_users = self.db.get_active_users()
-        
-        for user in active_users:
+        for user in self.db.get_active_users():
             try:
-                await self.send_evening_check_in(user['chat_id'], user['user_id'])
-                logger.info(f"Sent evening check-in to user {user['user_id']}")
+                result = await self.ai.generate_check_in(user['user_id'], "evening")
+                message = f"{result['message']}\n\nYou did good today."
+                await self.app.bot.send_message(chat_id=user['chat_id'], text=message)
             except Exception as e:
                 logger.error(f"Failed to send evening check-in to user {user['user_id']}: {e}")
-    
-    async def send_evening_check_in(self, chat_id: int, user_id: int):
-        """Send evening check-in to specific user"""
-        try:
-            result = await self.ai.generate_check_in(user_id, "evening")
-            await self.app.bot.send_message(chat_id=chat_id, text=result['message'])
-        except Exception as e:
-            logger.error(f"Evening check-in error: {e}")
-    
-    async def send_midday_boost(self):
-        """Send midday motivation to active users who need it"""
-        logger.info("Running midday boost check...")
-        active_users = self.db.get_active_users()
-        
-        for user in active_users:
-            try:
-                await self.send_midday_motivation(user['chat_id'], user['user_id'])
-            except Exception as e:
-                logger.error(f"Failed to send midday boost to user {user['user_id']}: {e}")
-    
-    async def send_midday_motivation(self, chat_id: int, user_id: int):
-        """Send midday motivation to specific user"""
-        try:
-            stats = self.db.get_stats(user_id)
-            
-            if stats['consecutive_misses'] >= 2 or stats['completed_today'] >= 3:
-                message = MotivationEngine.get_personalized_motivation(stats)
-                await self.app.bot.send_message(chat_id=chat_id, text=message)
-                logger.info(f"Sent midday boost to user {user_id}")
-        except Exception as e:
-            logger.error(f"Midday boost error: {e}")
-    
+
+    async def send_random_check_ins(self):
+        """Periodically sends a random check-in to active users."""
+        if random.random() > 0.6:  # 40% chance to send a check-in each hour
+            logger.info("Executing random check-in...")
+            for user in self.db.get_active_users():
+                try:
+                    tasks = self.db.get_tasks(user['user_id'], completed=False)
+                    quote = await self.motivation.get_ai_generated_quote()
+                    
+                    if not tasks:
+                        message = f"Just checking in. Your plate is clear. Keep that momentum.\n\n{quote}"
+                    else:
+                        task_list = self.ai._format_tasks_for_ai(tasks)
+                        message = f"Quick check-in. Here's what's on your agenda:\n{task_list}\n\n{quote}"
+                    
+                    await self.app.bot.send_message(chat_id=user['chat_id'], text=message)
+                except Exception as e:
+                    logger.error(f"Failed to send random check-in to user {user['user_id']}: {e}")
+
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle all text messages through AI"""
-        user_id = update.effective_user.id
-        chat_id = update.effective_chat.id
-        message = update.message.text
-        
+        user_id, chat_id, message = update.effective_user.id, update.effective_chat.id, update.message.text
         self.db.register_user(user_id, chat_id)
-        
         self.db.add_message(user_id, "user", message)
-        
         await update.message.chat.send_action("typing")
         
         result = await self.ai.process_message(user_id, chat_id, message)
         
-        action_results = []
         for action in result.get('actions', []):
-            action_result = await self.execute_action(user_id, chat_id, action)
-            if action_result:
-                action_results.append(action_result)
+            await self.execute_action(user_id, chat_id, action)
         
         reply = result.get('reply', 'Got it.')
-        
         self.db.add_message(user_id, "assistant", reply)
-        
-        sent_message = await update.message.reply_text(reply)
-        
-        if action_results and 'task_id' in action_results[0]:
-            self.db.store_message_task_map(
-                sent_message.message_id, 
-                action_results[0]['task_id'], 
-                chat_id
-            )
-    
-    async def execute_action(self, user_id: int, chat_id: int, action: Dict) -> Optional[Dict]:
+        await update.message.reply_text(reply)
+
+    async def execute_action(self, user_id: int, chat_id: int, action: Dict):
         """Execute action returned by AI"""
         action_type = action.get('type')
-        
         try:
             if action_type == 'create_task':
-                due_date = None
-                if action.get('due_date'):
-                    due_date = self.parse_due_date(action['due_date'])
-                
-                task_id = self.db.add_task(
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    title=action['title'],
-                    due_date=due_date
-                )
-                
+                due_date = self.parse_due_date(action.get('due_date'))
+                task_id = self.db.add_task(user_id=user_id, chat_id=chat_id, title=action['title'], due_date=due_date)
                 if due_date:
                     await self.schedule_reminder(task_id, due_date, action['title'], chat_id)
-                
-                return {'task_id': task_id}
-            
-            elif action_type == 'complete_task':
-                task_id = action.get('task_id')
-                if task_id:
-                    self.db.complete_task(task_id)
-                    self.db.record_completion(user_id)
-                    return {'completed': task_id}
-            
-            elif action_type == 'delete_task':
-                task_id = action.get('task_id')
-                if task_id:
-                    self.db.delete_task(task_id)
-                    return {'deleted': task_id}
-            
-            elif action_type == 'reschedule_task':
-                task_id = action.get('task_id')
+            elif action_type == 'complete_task' and action.get('task_id'):
+                self.db.complete_task(action['task_id'])
+                self.db.record_completion(user_id)
+            elif action_type == 'delete_task' and action.get('task_id'):
+                self.db.delete_task(action['task_id'])
+            elif action_type == 'reschedule_task' and action.get('task_id') and action.get('new_due_date'):
                 new_due = self.parse_due_date(action.get('new_due_date'))
-                if task_id and new_due:
+                if new_due:
+                    task_id = action['task_id']
                     self.db.update_task(task_id, due_date=new_due)
                     self.db.increment_push_count(task_id)
-                    
                     task = self.db.get_task(task_id)
                     await self.schedule_reminder(task_id, new_due, task['title'], chat_id)
-                    return {'rescheduled': task_id}
-            
         except Exception as e:
-            logger.error(f"Action execution error: {e}")
-        
-        return None
-    
-    def parse_due_date(self, due_str: str) -> Optional[datetime]:
+            logger.error(f"Action execution error: {action_type} - {e}")
+
+    def parse_due_date(self, due_str: Optional[str]) -> Optional[datetime]:
         """Parse due date string to datetime"""
+        if not due_str:
+            return None
         try:
-            if 'T' in due_str or '-' in due_str:
-                dt = datetime.fromisoformat(due_str.replace('Z', '+00:00'))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=self.user_timezone)
-                return dt
-        except:
-            pass
-        
-        return None
+            dt = datetime.fromisoformat(due_str.replace('Z', '+00:00'))
+            return dt.astimezone(self.user_timezone) if dt.tzinfo else dt.replace(tzinfo=self.user_timezone)
+        except (ValueError, TypeError):
+            return None
     
     async def schedule_reminder(self, task_id: int, due_date: datetime, title: str, chat_id: int):
         """Schedule task reminder"""
         job_id = f"task_{task_id}"
-        
-        if due_date.tzinfo is None:
-            due_date = due_date.replace(tzinfo=self.user_timezone)
-        
-        due_date = due_date.astimezone(self.user_timezone)
-        
         now = datetime.now(self.user_timezone)
         if due_date > now:
-            self.scheduler.add_job(
-                self.send_task_reminder,
-                trigger=DateTrigger(run_date=due_date),
-                args=[chat_id, title, task_id],
-                id=job_id,
-                replace_existing=True
-            )
-            
+            self.scheduler.add_job(self.send_task_reminder, trigger=DateTrigger(run_date=due_date),
+                                   args=[chat_id, title, task_id], id=job_id, replace_existing=True)
             self.db.update_task(task_id, job_id=job_id)
             logger.info(f"Scheduled reminder for task {task_id} at {due_date}")
     
     async def send_task_reminder(self, chat_id: int, title: str, task_id: int):
-        """Send task reminder"""
+        """Send task reminder with a cleaner message."""
         try:
-            message = f"⏰ {title}\n\nReact with 👍 to mark done, or tell me when to remind you again."
-            
+            message = f"⏰ Reminder: {title}"
             sent_message = await self.app.bot.send_message(chat_id=chat_id, text=message)
-            
             self.db.store_message_task_map(sent_message.message_id, task_id, chat_id)
-            
             logger.info(f"Sent reminder for task {task_id} to chat {chat_id}")
-            
         except Exception as e:
             logger.error(f"Reminder error for task {task_id}: {e}")
     
     async def handle_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle message reactions for task completion"""
-        if not update.message_reaction:
+        if not update.message_reaction or not update.message_reaction.new_reaction:
             return
         
         user_id = update.effective_user.id
         message_id = update.message_reaction.message_id
-        chat_id = update.message_reaction.chat.id
-        reaction = update.message_reaction
         
-        logger.info(f"Reaction detected: user {user_id}, message {message_id}")
-        
-        completion_emojis = ['👍', '✅', '✔️', '🔥']
-        
-        if reaction.new_reaction:
-            for emoji_reaction in reaction.new_reaction:
-                emoji = emoji_reaction.emoji if hasattr(emoji_reaction, 'emoji') else str(emoji_reaction)
-                logger.info(f"Emoji: {emoji}")
-                
-                if emoji in completion_emojis:
-                    task_id = self.db.get_task_from_message(message_id)
-                    
-                    if task_id:
-                        self.db.complete_task(task_id)
-                        self.db.record_completion(user_id)
-                        
-                        confirm_msg = "✅ Marked complete"
-                        if emoji == '🔥':
-                            confirm_msg = "🔥 Crushed it"
-                        
-                        await self.app.bot.send_message(
-                            chat_id=chat_id,
-                            text=confirm_msg
-                        )
-                        logger.info(f"Task {task_id} completed via reaction by user {user_id}")
-                    else:
-                        logger.warning(f"No task found for message {message_id}")
+        if any(r.emoji in ['👍', '✅', '✔️', '🔥'] for r in update.message_reaction.new_reaction):
+            task_id = self.db.get_task_from_message(message_id)
+            if task_id:
+                self.db.complete_task(task_id)
+                self.db.record_completion(user_id)
+                await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Marked complete")
+                logger.info(f"Task {task_id} completed via reaction by user {user_id}")
+            else:
+                logger.warning(f"No task found for reaction on message {message_id}")
     
     async def post_init(self, application):
         """Called after bot starts - reload pending reminders"""
@@ -954,15 +707,10 @@ class PersonalAssistantBot:
         logger.info("=" * 60)
         logger.info("Personal Assistant Bot Starting")
         logger.info("=" * 60)
-        logger.info(f"Timezone: Europe/London")
-        logger.info(f"Current time: {datetime.now(self.user_timezone)}")
-        logger.info(f"Morning check-ins: 7:30 AM")
-        logger.info(f"Evening check-ins: 8:00 PM")
-        logger.info(f"Midday boost: 1:00 PM")
+        logger.info(f"Timezone: Europe/London | Current time: {datetime.now(self.user_timezone)}")
         logger.info("=" * 60)
         
         self.app.post_init = self.post_init
-        
         self.app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
@@ -971,10 +719,10 @@ if __name__ == "__main__":
     GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
     DATABASE_URL = os.environ.get("DATABASE_URL")
     
-    if not TELEGRAM_TOKEN or not GROQ_API_KEY or not DATABASE_URL:
-        logger.error("Missing environment variables!")
-        logger.error("Required: TELEGRAM_BOT_TOKEN, GROQ_API_KEY, DATABASE_URL")
+    if not all([TELEGRAM_TOKEN, GROQ_API_KEY, DATABASE_URL]):
+        logger.error("Missing environment variables! Required: TELEGRAM_BOT_TOKEN, GROQ_API_KEY, DATABASE_URL")
         exit(1)
     
     bot = PersonalAssistantBot(TELEGRAM_TOKEN, GROQ_API_KEY)
     bot.run()
+
