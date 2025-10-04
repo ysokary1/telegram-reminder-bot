@@ -398,32 +398,28 @@ class ConversationAI:
         # Build context for AI
         uk_time = datetime.now(ZoneInfo('Europe/London'))
         
-        # --- FIXED PROMPT V2 ---
+        # --- FIXED PROMPT V3 ---
         system_prompt = f"""You are a personal assistant. Your tone is natural, supportive, and efficient. You sound like a real person, not a hyper-enthusiastic bot.
 
 Current time: {uk_time.isoformat()}
 
-Active tasks (first 5):
-{self._format_tasks_for_ai(active_tasks[:5])}
+Active tasks:
+{self._format_tasks_for_ai(active_tasks)}
 
-Recent conversation:
-{self._format_conversation(recent_messages)}
-
-YOUR STYLE:
+YOUR STYLE AND RULES:
+- **Source of Truth:** The 'Active tasks' list above is the ONLY source of truth for what is pending. Base your replies ONLY on this list. Do NOT infer task status from the conversation history. If the list is empty, there are no active tasks.
 - **Natural & Supportive:** Be personable and direct. Your goal is to help, not to distract.
 - **Task Confirmation:** For simple task actions, be brief. "Got it, added 'Call Steve tomorrow'." or "Done."
 - **Handle Dates Correctly:** When a due date is relative (e.g., 'in 2 minutes', 'tomorrow at 3pm'), you MUST calculate the exact ISO 8601 timestamp based on the current time and include it in the 'due_date' field.
-- **Don't Overdo It:** Avoid repeatedly mentioning the number of tasks completed. A simple 'Great job' or 'Marked as complete' is enough. Let the user feel productive without constant reminders of the count.
-- **Follow The User's Lead:** Don't ask "What's next?" or "What else?" after every single action. If the user completes a task, confirm it and wait for their next instruction. Only prompt them if they seem stuck or ask for guidance.
-- **Pattern Recognition:** If a task has been pushed multiple times (times_pushed > 2), gently call it out. "I've noticed 'Finish report' has been pushed a few times. Anything blocking you?"
+- **Don't Overdo It:** Avoid repeatedly mentioning the number of tasks completed. A simple 'Great job' or 'Marked as complete' is enough.
+- **Follow The User's Lead:** Don't ask "What's next?" after every action. If a user completes a task, confirm it and wait for their next instruction. Only prompt if they ask for guidance.
 
 Return ONLY JSON with "reply" and "actions" keys.
 {{
   "reply": "Your natural, personable response goes here.",
   "actions": [
-    {{"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SS+01:00 or null", "priority": "high/medium/low", "commitment": true/false}},
+    {{"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SS+01:00 or null"}},
     {{"type": "complete_task", "task_id": 123}},
-    {{"type": "show_tasks", "filter": "today/overdue/all"}},
     {{"type": "delete_task", "task_id": 123}},
     {{"type": "reschedule_task", "task_id": 123, "new_due_date": "YYYY-MM-DDTHH:MM:SS+01:00"}}
   ]
@@ -459,8 +455,6 @@ Return ONLY JSON with "reply" and "actions" keys.
                 
                 content = response.json()['choices'][0]['message']['content'].strip()
                 
-                # The AI sometimes adds conversational text before the JSON, even with JSON mode.
-                # This robustly extracts the JSON object from the response string.
                 json_start = content.find('{')
                 json_end = content.rfind('}') + 1
                 
@@ -474,7 +468,6 @@ Return ONLY JSON with "reply" and "actions" keys.
                         "actions": []
                     }
 
-                # Ensure actions is a list
                 if 'actions' not in result:
                     result['actions'] = []
                 
@@ -521,14 +514,12 @@ Return ONLY JSON with "reply" and "actions" keys.
             formatted.append(f"{msg['role']}: {msg['message']}")
         return "\n".join(formatted)
     
-    # --- FIXED SYNTAX ERROR ---
     async def generate_check_in(self, user_id: int, check_in_type: str) -> Dict:
         """Generate proactive check-in message"""
         tasks = self.db.get_tasks(user_id, completed=False)
         stats = self.db.get_stats(user_id)
         uk_time = datetime.now(ZoneInfo('Europe/London'))
         
-        # Get tasks for today
         today_tasks = self.db.get_tasks(user_id, completed=False, due_today=True)
         overdue_tasks = self.db.get_tasks(user_id, completed=False, overdue=True)
         
@@ -541,8 +532,6 @@ Stats:
 - {len(tasks)} active tasks total
 - {len(today_tasks)} due today
 - {len(overdue_tasks)} overdue
-- {stats['completed_week']} completed this week
-- {stats['consecutive_misses']} consecutive misses
 
 Tasks due today:
 {self._format_tasks_for_ai(today_tasks)}
@@ -561,7 +550,6 @@ Create a morning check-in. Be direct. If there are tasks that keep getting pushe
 
 Today's completion: {len(completed_today)} tasks completed
 Still pending: {len(today_tasks)} tasks due today not completed
-Stats: {stats['completed_week']} completed this week
 
 Pending tasks:
 {self._format_tasks_for_ai(today_tasks)}
@@ -594,7 +582,6 @@ Create an evening reflection. Brief and honest. Celebrate wins if there were any
         except Exception as e:
             logger.error(f"Check-in generation error: {e}")
         
-        # Fallback
         if check_in_type == "morning":
             return {"message": f"Morning. You have {len(today_tasks)} tasks today."}
         else:
@@ -649,30 +636,25 @@ class PersonalAssistantBot:
         self.ai = ConversationAI(groq_api_key, self.db)
         self.user_timezone = ZoneInfo('Europe/London')
         
-        # Handlers
         self.app.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND, 
             self.handle_message
         ))
         
-        # FIXED: Register reaction handler properly
         self.app.add_handler(MessageReactionHandler(
             self.handle_reaction
         ))
         
-        # Schedule check-ins
         self.schedule_check_ins()
     
     async def reload_pending_reminders(self):
         """Reload all pending task reminders on startup - CRITICAL FIX"""
         logger.info("Reloading pending reminders...")
         
-        # Get all active users
         active_users = self.db.get_active_users()
         
         reloaded_count = 0
         for user in active_users:
-            # Get all incomplete tasks with due dates for this user
             conn = self.db.get_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             
@@ -688,7 +670,6 @@ class PersonalAssistantBot:
             pending_tasks = [dict(row) for row in cursor.fetchall()]
             conn.close()
             
-            # Reschedule each one
             for task in pending_tasks:
                 due_date = datetime.fromisoformat(str(task['due_date']))
                 if due_date.tzinfo is None:
@@ -707,21 +688,18 @@ class PersonalAssistantBot:
     
     def schedule_check_ins(self):
         """Schedule morning and evening check-ins"""
-        # Morning at 7:30 AM
         self.scheduler.add_job(
             self.send_morning_check_ins,
             trigger=CronTrigger(hour=7, minute=30),
             id='morning_check'
         )
         
-        # Evening at 8:00 PM
         self.scheduler.add_job(
             self.send_evening_check_ins,
             trigger=CronTrigger(hour=20, minute=0),
             id='evening_check'
         )
         
-        # Midday motivation at 1:00 PM
         self.scheduler.add_job(
             self.send_midday_boost,
             trigger=CronTrigger(hour=13, minute=0),
@@ -745,7 +723,6 @@ class PersonalAssistantBot:
         try:
             result = await self.ai.generate_check_in(user_id, "morning")
             
-            # Add motivational quote
             quote = MotivationEngine.get_random_quote()
             message = f"{result['message']}\n\n💪 {quote}"
             
@@ -789,7 +766,6 @@ class PersonalAssistantBot:
         try:
             stats = self.db.get_stats(user_id)
             
-            # Only send if user is active and could use a boost
             if stats['consecutive_misses'] >= 2 or stats['completed_today'] >= 3:
                 message = MotivationEngine.get_personalized_motivation(stats)
                 await self.app.bot.send_message(chat_id=chat_id, text=message)
@@ -803,34 +779,26 @@ class PersonalAssistantBot:
         chat_id = update.effective_chat.id
         message = update.message.text
         
-        # Register user activity
         self.db.register_user(user_id, chat_id)
         
-        # Store user message
         self.db.add_message(user_id, "user", message)
         
-        # Show typing indicator
         await update.message.chat.send_action("typing")
         
-        # Process through AI
         result = await self.ai.process_message(user_id, chat_id, message)
         
-        # Execute actions
         action_results = []
         for action in result.get('actions', []):
             action_result = await self.execute_action(user_id, chat_id, action)
             if action_result:
                 action_results.append(action_result)
         
-        # Send reply
         reply = result.get('reply', 'Got it.')
         
-        # Store bot message
         self.db.add_message(user_id, "assistant", reply)
         
         sent_message = await update.message.reply_text(reply)
         
-        # Store message-task mapping for reaction handling
         if action_results and 'task_id' in action_results[0]:
             self.db.store_message_task_map(
                 sent_message.message_id, 
@@ -844,7 +812,6 @@ class PersonalAssistantBot:
         
         try:
             if action_type == 'create_task':
-                # Parse due date
                 due_date = None
                 if action.get('due_date'):
                     due_date = self.parse_due_date(action['due_date'])
@@ -853,12 +820,9 @@ class PersonalAssistantBot:
                     user_id=user_id,
                     chat_id=chat_id,
                     title=action['title'],
-                    due_date=due_date,
-                    priority=action.get('priority', 'medium'),
-                    commitment=action.get('commitment', False)
+                    due_date=due_date
                 )
                 
-                # Schedule reminder if due date exists
                 if due_date:
                     await self.schedule_reminder(task_id, due_date, action['title'], chat_id)
                 
@@ -884,7 +848,6 @@ class PersonalAssistantBot:
                     self.db.update_task(task_id, due_date=new_due)
                     self.db.increment_push_count(task_id)
                     
-                    # Reschedule reminder
                     task = self.db.get_task(task_id)
                     await self.schedule_reminder(task_id, new_due, task['title'], chat_id)
                     return {'rescheduled': task_id}
@@ -897,7 +860,6 @@ class PersonalAssistantBot:
     def parse_due_date(self, due_str: str) -> Optional[datetime]:
         """Parse due date string to datetime"""
         try:
-            # If it's already ISO format
             if 'T' in due_str or '-' in due_str:
                 dt = datetime.fromisoformat(due_str.replace('Z', '+00:00'))
                 if dt.tzinfo is None:
@@ -912,14 +874,11 @@ class PersonalAssistantBot:
         """Schedule task reminder"""
         job_id = f"task_{task_id}"
         
-        # Ensure due_date is timezone-aware
         if due_date.tzinfo is None:
             due_date = due_date.replace(tzinfo=self.user_timezone)
         
-        # Convert to UK timezone
         due_date = due_date.astimezone(self.user_timezone)
         
-        # Only schedule if in future
         now = datetime.now(self.user_timezone)
         if due_date > now:
             self.scheduler.add_job(
@@ -940,7 +899,6 @@ class PersonalAssistantBot:
             
             sent_message = await self.app.bot.send_message(chat_id=chat_id, text=message)
             
-            # Store message-task mapping for reaction handling
             self.db.store_message_task_map(sent_message.message_id, task_id, chat_id)
             
             logger.info(f"Sent reminder for task {task_id} to chat {chat_id}")
@@ -960,7 +918,6 @@ class PersonalAssistantBot:
         
         logger.info(f"Reaction detected: user {user_id}, message {message_id}")
         
-        # Check if it's a completion reaction
         completion_emojis = ['👍', '✅', '✔️', '🔥']
         
         if reaction.new_reaction:
@@ -969,14 +926,12 @@ class PersonalAssistantBot:
                 logger.info(f"Emoji: {emoji}")
                 
                 if emoji in completion_emojis:
-                    # Get task from message mapping
                     task_id = self.db.get_task_from_message(message_id)
                     
                     if task_id:
                         self.db.complete_task(task_id)
                         self.db.record_completion(user_id)
                         
-                        # Send confirmation
                         confirm_msg = "✅ Marked complete"
                         if emoji == '🔥':
                             confirm_msg = "🔥 Crushed it"
@@ -1006,7 +961,6 @@ class PersonalAssistantBot:
         logger.info(f"Midday boost: 1:00 PM")
         logger.info("=" * 60)
         
-        # Register post_init callback
         self.app.post_init = self.post_init
         
         self.app.run_polling(allowed_updates=Update.ALL_TYPES)
