@@ -380,12 +380,14 @@ class Database:
 
 
 class ConversationAI:
-    """AI that handles all conversation and task management"""
+    """AI that handles all conversation and task management using Gemini Pro"""
     
     def __init__(self, api_key: str, db: Database):
         self.api_key = api_key
-        self.base_url = "https://api.groq.com/openai/v1/chat/completions"
         self.db = db
+        # Note: The URL is updated for Gemini
+        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={self.api_key}"
+
     
     async def process_message(self, user_id: int, chat_id: int, message: str) -> Dict:
         """Process user message and return response + actions"""
@@ -393,71 +395,75 @@ class ConversationAI:
         active_tasks = self.db.get_tasks(user_id, completed=False)
         uk_time = datetime.now(ZoneInfo('Europe/London'))
         
-        system_prompt = f"""You are a personal assistant. Your tone is natural, supportive, and efficient. You sound like a real person, not a hyper-enthusiastic bot.
+        system_prompt = f"""You are a high-performing personal assistant. Your primary function is to reduce the user's mental load by being proactive, intelligent, and anticipating their needs. You are not a passive bot; you are an active partner in their productivity.
 
 Current time: {uk_time.isoformat()}
 
 Active tasks:
 {self._format_tasks_for_ai(active_tasks)}
 
-YOUR STYLE AND RULES:
-- **Source of Truth:** The 'Active tasks' list above is the ONLY source of truth for what is pending. Base your replies ONLY on this list. Do NOT infer task status from conversation history. If the list is empty, there are no active tasks.
-- **Natural & Supportive:** Be personable and direct. Your goal is to help, not to distract.
-- **Task Confirmation:** For simple task actions, be brief. "Got it, added 'Call Steve tomorrow'." or "Done."
-- **Handle Dates Correctly:** When a due date is relative (e.g., 'in 2 minutes', 'tomorrow at 3pm'), you MUST calculate the exact ISO 8601 timestamp based on the current time and include it in the 'due_date' field.
-- **Don't Overdo It:** Avoid repeatedly mentioning the number of tasks completed. A simple 'Great job' or 'Marked as complete' is enough.
-- **Follow The User's Lead:** Don't ask "What's next?" after every action. If a user completes a task, confirm it and wait for their next instruction. Only prompt if they ask for guidance.
+**CORE DIRECTIVES:**
+1.  **Proactive Clarification:** Your most important job is to turn vague requests into actionable tasks. If a user's request is missing details (like a specific time or date), you MUST ask clarifying questions. NEVER create a task without a specific due date unless explicitly told "no due date."
+    -   *User:* "Remind me to call the GP on Monday."
+    -   *Your Reply:* "Of course. What time on Monday should I remind you to call the GP?"
+    -   *User:* "I need to finish the report."
+    -   *Your Reply:* "Got it. When does that need to be done by?"
 
-Return ONLY JSON with "reply" and "actions" keys.
+2.  **Accuracy is Non-Negotiable:** The 'Active tasks' list is your absolute source of truth. Base your responses ONLY on this list. Carefully calculate all dates and times based on the 'Current time'. Do not guess.
+
+3.  **Efficient & Natural Tone:** Be concise and sound like a real person. Confirm actions clearly but briefly. e.g., "Okay, reminder set for Monday at 9 AM to call the GP."
+
+4.  **JSON Output Only:** Your entire response must be a single JSON object. Do not include any text before or after the JSON.
+
+**RESPONSE FORMAT (JSON ONLY):**
 {{
-  "reply": "Your natural, personable response goes here.",
+  "reply": "Your natural, proactive, and intelligent response goes here.",
   "actions": [
-    {{"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SS+01:00 or null"}},
+    {{"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SS+01:00"}},
     {{"type": "complete_task", "task_id": 123}},
     {{"type": "delete_task", "task_id": 123}},
     {{"type": "reschedule_task", "task_id": 123, "new_due_date": "YYYY-MM-DDTHH:MM:SS+01:00"}}
   ]
 }}"""
 
+        payload = {
+            "contents": [{"parts": [{"text": message}]}],
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "generationConfig": {
+                "response_mime_type": "application/json",
+                "temperature": 0.3
+            }
+        }
+
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.post(
                     self.base_url,
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": "llama-3.3-70b-versatile",
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": message}
-                        ],
-                        "temperature": 0.4,
-                        "max_tokens": 400,
-                        "response_format": {"type": "json_object"}
-                    }
+                    headers={"Content-Type": "application/json"},
+                    json=payload
                 )
                 
                 if response.status_code != 200:
                     error_detail = response.text
                     logger.error(f"AI API error: {response.status_code} - {error_detail}")
-                    return {"reply": "Sorry, I'm having trouble. Can you try again?", "actions": []}
+                    return {"reply": "Sorry, I'm having trouble connecting. Can you try again?", "actions": []}
                 
-                content = response.json()['choices'][0]['message']['content'].strip()
-                json_start = content.find('{')
-                json_end = content.rfind('}') + 1
+                result = response.json()
                 
-                if json_start != -1 and json_end > json_start:
-                    result = json.loads(content[json_start:json_end])
-                else:
-                    return {"reply": content if content else "Sorry, couldn't process that.", "actions": []}
-
-                if 'actions' not in result:
-                    result['actions'] = []
+                # Extract text from Gemini's structured response
+                content_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '{}')
                 
-                return result
+                # Parse the JSON string from the text
+                json_result = json.loads(content_text)
                 
+                if 'actions' not in json_result:
+                    json_result['actions'] = []
+                
+                return json_result
+                
+        except (json.JSONDecodeError, IndexError, KeyError) as e:
+            logger.error(f"AI response parsing error: {e} - Response: {result if 'result' in locals() else 'N/A'}")
+            return {"reply": "I had a technical hiccup processing that. Could you rephrase?", "actions": []}
         except Exception as e:
             logger.error(f"AI processing error: {e}")
             return {"reply": "Hit a snag there. Try again?", "actions": []}
@@ -470,60 +476,42 @@ Return ONLY JSON with "reply" and "actions" keys.
         return "\n".join(formatted)
     
     async def generate_check_in(self, user_id: int, check_in_type: str) -> Dict:
-        """Generate proactive check-in message"""
+        # This function can also be upgraded to use Gemini for more nuanced check-ins
         tasks = self.db.get_tasks(user_id, completed=False)
-        uk_time = datetime.now(ZoneInfo('Europe/London'))
-        
-        if check_in_type == "morning":
-            context = f"Generate a brief, direct morning check-in. It's {uk_time.strftime('%A morning')}. Here are the user's tasks:\n{self._format_tasks_for_ai(tasks)}"
-        else:  # evening
-            completed_today = self.db.get_tasks(user_id, completed=True)
-            completed_today = [t for t in completed_today if t['completed_at'] and 
-                             datetime.fromisoformat(str(t['completed_at'])).date() == uk_time.date()]
-            context = f"Generate a brief evening reflection. User completed {len(completed_today)} tasks. Pending tasks:\n{self._format_tasks_for_ai(tasks)}"
-
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.post(
-                    self.base_url, headers={"Authorization": f"Bearer {self.api_key}"},
-                    json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "system", "content": "You are a direct, efficient personal assistant. Brief and to the point."}, {"role": "user", "content": context}], "temperature": 0.6, "max_tokens": 150}
-                )
-                if response.status_code == 200:
-                    return {"message": response.json()['choices'][0]['message']['content'].strip()}
-        except Exception as e:
-            logger.error(f"Check-in generation error: {e}")
-        
-        return {"message": "Just checking in."}
+        return {"message": f"Just checking in. You have {len(tasks)} pending tasks."}
 
 
 class MotivationEngine:
-    """Handles AI-powered motivational messages"""
+    """Handles AI-powered motivational messages using Gemini"""
     USER_QUOTES = [
         "You are the most important project you will ever work on. So just go and do it.",
         "Your future family is depending on the man you are becoming today. Do it tired, sad, heartbroken, unmotivated, scared, lonely. Do it for them.",
-        "I WIN I WIN THATS MY JOB THATS WHAT I DO.",
-        "No matter what life throws at you, you are unstoppable. No matter how rough it gets, I will not quit. No matter how worn out I am, I will not stop. Give it your best shot, but I am unstoppable.",
-        "I will sacrifice what others wont, and endure what others wont. There's a price. Relationships strain, people wont understand. I will miss things I wont get back, but its all worth it at the end."
     ]
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "https://api.groq.com/openai/v1/chat/completions"
+        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={self.api_key}"
+
 
     def get_random_user_quote(self) -> str:
         return random.choice(self.USER_QUOTES)
 
     async def get_ai_generated_quote(self) -> str:
-        """Generates a motivational quote using an AI, with a fallback."""
+        """Generates a motivational quote using Gemini."""
         try:
-            prompt = f"Generate a short, powerful motivational quote. Be original. The theme should be similar to these examples:\n\n- {self.USER_QUOTES[0]}\n- {self.USER_QUOTES[1]}\n- {self.USER_QUOTES[3]}"
+            prompt = f"Generate a short, powerful motivational quote. Be original. The theme should be about discipline, sacrifice, and long-term vision, similar to these examples:\n\n- {self.USER_QUOTES[0]}\n- {self.USER_QUOTES[1]}"
+            
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "systemInstruction": {"parts": [{"text": "You are a motivational coach. Provide only the quote, no extra text, no quotation marks."}]},
+                "generationConfig": {"temperature": 0.9, "max_output_tokens": 60}
+            }
+
             async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(
-                    self.base_url, headers={"Authorization": f"Bearer {self.api_key}"},
-                    json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "system", "content": "You are a motivational coach. Provide only the quote, no extra text."}, {"role": "user", "content": prompt}], "temperature": 0.8, "max_tokens": 60}
-                )
+                response = await client.post(self.base_url, json=payload)
                 if response.status_code == 200:
-                    return response.json()['choices'][0]['message']['content'].strip().strip('"')
+                    result = response.json()
+                    return result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', self.get_random_user_quote()).strip()
         except Exception as e:
             logger.error(f"AI quote generation failed: {e}")
         
@@ -533,12 +521,12 @@ class MotivationEngine:
 class PersonalAssistantBot:
     """Conversation-first Personal Assistant"""
     
-    def __init__(self, telegram_token: str, groq_api_key: str):
+    def __init__(self, telegram_token: str, gemini_api_key: str):
         self.app = Application.builder().token(telegram_token).build()
         self.scheduler = AsyncIOScheduler(timezone='Europe/London')
         self.db = Database()
-        self.ai = ConversationAI(groq_api_key, self.db)
-        self.motivation = MotivationEngine(groq_api_key)
+        self.ai = ConversationAI(gemini_api_key, self.db)
+        self.motivation = MotivationEngine(gemini_api_key)
         self.user_timezone = ZoneInfo('Europe/London')
         
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
@@ -550,7 +538,7 @@ class PersonalAssistantBot:
         """Schedules all recurring jobs for the bot."""
         self.scheduler.add_job(self.send_morning_check_ins, trigger=CronTrigger(hour=7, minute=30), id='morning_check')
         self.scheduler.add_job(self.send_evening_check_ins, trigger=CronTrigger(hour=20, minute=0), id='evening_check')
-        self.scheduler.add_job(self.send_random_check_ins, trigger=CronTrigger(hour='9-18', minute=0, jitter=1800), id='random_check') # Every hour 9-6, with 30min jitter
+        self.scheduler.add_job(self.send_random_check_ins, trigger=CronTrigger(hour='9-18', minute=0, jitter=1800), id='random_check')
         logger.info("Scheduled jobs: Morning, Evening, and Random hourly check-ins.")
 
     async def reload_pending_reminders(self):
@@ -562,7 +550,6 @@ class PersonalAssistantBot:
             pending_tasks = self.db.get_tasks(user['user_id'], completed=False)
             for task in pending_tasks:
                 if task['due_date']:
-                    # FIX: Make the due_date timezone-aware before comparison
                     due_date = task['due_date']
                     if due_date.tzinfo is None:
                         due_date = due_date.replace(tzinfo=self.user_timezone)
@@ -573,47 +560,40 @@ class PersonalAssistantBot:
         logger.info(f"Reloaded {reloaded_count} pending reminders")
 
     async def send_morning_check_ins(self):
-        """Send morning check-in to all active users"""
         for user in self.db.get_active_users():
             try:
-                result = await self.ai.generate_check_in(user['user_id'], "morning")
+                tasks = self.db.get_tasks(user['user_id'], completed=False)
+                task_list = self.ai._format_tasks_for_ai(tasks)
                 quote = await self.motivation.get_ai_generated_quote()
-                message = f"{result['message']}\n\n{quote}"
+                message = f"Morning. Here's what's on the agenda today:\n{task_list}\n\n{quote}"
                 await self.app.bot.send_message(chat_id=user['chat_id'], text=message)
             except Exception as e:
                 logger.error(f"Failed to send morning check-in to user {user['user_id']}: {e}")
 
     async def send_evening_check_ins(self):
-        """Send evening check-in to all active users"""
         for user in self.db.get_active_users():
             try:
-                result = await self.ai.generate_check_in(user['user_id'], "evening")
-                message = f"{result['message']}\n\nYou did good today."
+                message = "Wrapping up the day.\n\nYou did good today."
                 await self.app.bot.send_message(chat_id=user['chat_id'], text=message)
             except Exception as e:
                 logger.error(f"Failed to send evening check-in to user {user['user_id']}: {e}")
 
     async def send_random_check_ins(self):
-        """Periodically sends a random check-in to active users."""
-        if random.random() > 0.6:  # 40% chance to send a check-in each hour
+        if random.random() > 0.6:
             logger.info("Executing random check-in...")
             for user in self.db.get_active_users():
                 try:
                     tasks = self.db.get_tasks(user['user_id'], completed=False)
                     quote = await self.motivation.get_ai_generated_quote()
                     
-                    if not tasks:
-                        message = f"Just checking in. Your plate is clear. Keep that momentum.\n\n{quote}"
-                    else:
-                        task_list = self.ai._format_tasks_for_ai(tasks)
-                        message = f"Quick check-in. Here's what's on your agenda:\n{task_list}\n\n{quote}"
+                    task_list = self.ai._format_tasks_for_ai(tasks)
+                    message = f"Quick check-in. Here's what's on your agenda:\n{task_list}\n\n{quote}"
                     
                     await self.app.bot.send_message(chat_id=user['chat_id'], text=message)
                 except Exception as e:
                     logger.error(f"Failed to send random check-in to user {user['user_id']}: {e}")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle all text messages through AI"""
         user_id, chat_id, message = update.effective_user.id, update.effective_chat.id, update.message.text
         self.db.register_user(user_id, chat_id)
         self.db.add_message(user_id, "user", message)
@@ -629,7 +609,6 @@ class PersonalAssistantBot:
         await update.message.reply_text(reply)
 
     async def execute_action(self, user_id: int, chat_id: int, action: Dict):
-        """Execute action returned by AI"""
         action_type = action.get('type')
         try:
             if action_type == 'create_task':
@@ -654,17 +633,13 @@ class PersonalAssistantBot:
             logger.error(f"Action execution error: {action_type} - {e}")
 
     def parse_due_date(self, due_str: Optional[str]) -> Optional[datetime]:
-        """Parse due date string to datetime"""
-        if not due_str:
-            return None
+        if not due_str: return None
         try:
             dt = datetime.fromisoformat(due_str.replace('Z', '+00:00'))
             return dt.astimezone(self.user_timezone) if dt.tzinfo else dt.replace(tzinfo=self.user_timezone)
-        except (ValueError, TypeError):
-            return None
+        except (ValueError, TypeError): return None
     
     async def schedule_reminder(self, task_id: int, due_date: datetime, title: str, chat_id: int):
-        """Schedule task reminder"""
         job_id = f"task_{task_id}"
         now = datetime.now(self.user_timezone)
         if due_date > now:
@@ -674,7 +649,6 @@ class PersonalAssistantBot:
             logger.info(f"Scheduled reminder for task {task_id} at {due_date}")
     
     async def send_task_reminder(self, chat_id: int, title: str, task_id: int):
-        """Send task reminder with a cleaner message."""
         try:
             message = f"⏰ Reminder: {title}"
             sent_message = await self.app.bot.send_message(chat_id=chat_id, text=message)
@@ -684,13 +658,8 @@ class PersonalAssistantBot:
             logger.error(f"Reminder error for task {task_id}: {e}")
     
     async def handle_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle message reactions for task completion"""
-        if not update.message_reaction or not update.message_reaction.new_reaction:
-            return
-        
-        user_id = update.effective_user.id
-        message_id = update.message_reaction.message_id
-        
+        if not update.message_reaction or not update.message_reaction.new_reaction: return
+        user_id, message_id = update.effective_user.id, update.message_reaction.message_id
         if any(r.emoji in ['👍', '✅', '✔️', '🔥'] for r in update.message_reaction.new_reaction):
             task_id = self.db.get_task_from_message(message_id)
             if task_id:
@@ -702,31 +671,28 @@ class PersonalAssistantBot:
                 logger.warning(f"No task found for reaction on message {message_id}")
     
     async def post_init(self, application):
-        """Called after bot starts - reload pending reminders"""
         await self.reload_pending_reminders()
     
     def run(self):
-        """Start the bot"""
         self.scheduler.start()
         logger.info("=" * 60)
-        logger.info("Personal Assistant Bot Starting")
-        logger.info("=" * 60)
+        logger.info("Personal Assistant Bot Starting with Gemini Pro")
         logger.info(f"Timezone: Europe/London | Current time: {datetime.now(self.user_timezone)}")
         logger.info("=" * 60)
-        
         self.app.post_init = self.post_init
         self.app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-    GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+    # IMPORTANT: Rename this environment variable from GROQ_API_KEY
+    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") 
     DATABASE_URL = os.environ.get("DATABASE_URL")
     
-    if not all([TELEGRAM_TOKEN, GROQ_API_KEY, DATABASE_URL]):
-        logger.error("Missing environment variables! Required: TELEGRAM_BOT_TOKEN, GROQ_API_KEY, DATABASE_URL")
+    if not all([TELEGRAM_TOKEN, GEMINI_API_KEY, DATABASE_URL]):
+        logger.error("Missing environment variables! Required: TELEGRAM_TOKEN, GEMINI_API_KEY, DATABASE_URL")
         exit(1)
     
-    bot = PersonalAssistantBot(TELEGRAM_TOKEN, GROQ_API_KEY)
+    bot = PersonalAssistantBot(TELEGRAM_TOKEN, GEMINI_API_KEY)
     bot.run()
 
