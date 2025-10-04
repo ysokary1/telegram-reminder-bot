@@ -385,7 +385,6 @@ class ConversationAI:
     def __init__(self, api_key: str, db: Database):
         self.api_key = api_key
         self.db = db
-        # Note: The URL is updated for Gemini
         self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={self.api_key}"
 
     
@@ -395,25 +394,29 @@ class ConversationAI:
         active_tasks = self.db.get_tasks(user_id, completed=False)
         uk_time = datetime.now(ZoneInfo('Europe/London'))
         
-        system_prompt = f"""You are a high-performing personal assistant. Your primary function is to reduce the user's mental load by being proactive, intelligent, and anticipating their needs. You are not a passive bot; you are an active partner in their productivity.
+        # New: Get recent conversation history for context
+        conversation_history = self.db.get_recent_messages(user_id, limit=10)
+
+        system_prompt = f"""You are a world-class personal assistant. Your primary function is to reduce the user's mental load by being proactive, intelligent, and anticipating their needs. You are an active partner in their productivity.
 
 Current time: {uk_time.isoformat()}
 
-Active tasks:
+**CONTEXTUAL INFORMATION:**
+- **Active Tasks:** This list is your absolute source of truth for pending items.
 {self._format_tasks_for_ai(active_tasks)}
 
 **CORE DIRECTIVES:**
-1.  **Proactive Clarification:** Your most important job is to turn vague requests into actionable tasks. If a user's request is missing details (like a specific time or date), you MUST ask clarifying questions. NEVER create a task without a specific due date unless explicitly told "no due date."
+1.  **Be Proactive, Not Passive:** Your most important job is to turn vague requests into fully actionable tasks. If a request is missing details (like a specific time or date), you MUST ask for clarification.
     -   *User:* "Remind me to call the GP on Monday."
-    -   *Your Reply:* "Of course. What time on Monday should I remind you to call the GP?"
+    -   *Correct Response:* "Of course. What time on Monday should I remind you?"
     -   *User:* "I need to finish the report."
-    -   *Your Reply:* "Got it. When does that need to be done by?"
+    -   *Correct Response:* "Understood. When does that need to be done by?"
 
-2.  **Accuracy is Non-Negotiable:** The 'Active tasks' list is your absolute source of truth. Base your responses ONLY on this list. Carefully calculate all dates and times based on the 'Current time'. Do not guess.
+2.  **Use Conversational Context:** Analyze the `conversation_history` to understand multi-step requests. If the user provides information in a separate message (like saying "12" after you ask for a time), you must connect it to the previous question.
 
-3.  **Efficient & Natural Tone:** Be concise and sound like a real person. Confirm actions clearly but briefly. e.g., "Okay, reminder set for Monday at 9 AM to call the GP."
+3.  **Accuracy is Paramount:** Base your understanding of pending tasks *only* on the 'Active Tasks' list. Carefully calculate all dates and times based on the 'Current time'.
 
-4.  **JSON Output Only:** Your entire response must be a single JSON object. Do not include any text before or after the JSON.
+4.  **JSON Output Only:** Your entire response must be a single, valid JSON object. Do not include any text, markdown, or commentary before or after the JSON structure.
 
 **RESPONSE FORMAT (JSON ONLY):**
 {{
@@ -426,12 +429,22 @@ Active tasks:
   ]
 }}"""
 
+        # New: Build the full conversation history for the API payload
+        gemini_conversation = []
+        for msg in conversation_history:
+            # Gemini uses 'model' for the assistant's role
+            role = "model" if msg['role'] == 'assistant' else 'user'
+            gemini_conversation.append({"role": role, "parts": [{"text": msg['message']}]})
+        
+        # Add the current user message
+        gemini_conversation.append({"role": "user", "parts": [{"text": message}]})
+
         payload = {
-            "contents": [{"parts": [{"text": message}]}],
+            "contents": gemini_conversation,
             "systemInstruction": {"parts": [{"text": system_prompt}]},
             "generationConfig": {
                 "response_mime_type": "application/json",
-                "temperature": 0.3
+                "temperature": 0.2 # Lower temperature for more predictable, less "creative" responses
             }
         }
 
@@ -449,11 +462,7 @@ Active tasks:
                     return {"reply": "Sorry, I'm having trouble connecting. Can you try again?", "actions": []}
                 
                 result = response.json()
-                
-                # Extract text from Gemini's structured response
                 content_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '{}')
-                
-                # Parse the JSON string from the text
                 json_result = json.loads(content_text)
                 
                 if 'actions' not in json_result:
@@ -476,7 +485,6 @@ Active tasks:
         return "\n".join(formatted)
     
     async def generate_check_in(self, user_id: int, check_in_type: str) -> Dict:
-        # This function can also be upgraded to use Gemini for more nuanced check-ins
         tasks = self.db.get_tasks(user_id, completed=False)
         return {"message": f"Just checking in. You have {len(tasks)} pending tasks."}
 
@@ -596,16 +604,21 @@ class PersonalAssistantBot:
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id, chat_id, message = update.effective_user.id, update.effective_chat.id, update.message.text
         self.db.register_user(user_id, chat_id)
+        # Store user message before processing
         self.db.add_message(user_id, "user", message)
+        
         await update.message.chat.send_action("typing")
         
         result = await self.ai.process_message(user_id, chat_id, message)
         
+        # Store assistant reply after processing
+        reply = result.get('reply', 'Got it.')
+        self.db.add_message(user_id, "assistant", reply)
+        
+        # Now execute actions and send reply to user
         for action in result.get('actions', []):
             await self.execute_action(user_id, chat_id, action)
         
-        reply = result.get('reply', 'Got it.')
-        self.db.add_message(user_id, "assistant", reply)
         await update.message.reply_text(reply)
 
     async def execute_action(self, user_id: int, chat_id: int, action: Dict):
@@ -685,7 +698,6 @@ class PersonalAssistantBot:
 
 if __name__ == "__main__":
     TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-    # IMPORTANT: Rename this environment variable from GROQ_API_KEY
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") 
     DATABASE_URL = os.environ.get("DATABASE_URL")
     
