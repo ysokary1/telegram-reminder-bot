@@ -141,7 +141,6 @@ class ConversationAI:
         for t in tasks:
             due_str = 'Not scheduled'
             if t['due_date']:
-                # Convert UTC time from DB to local timezone for display
                 local_due = t['due_date'].astimezone(self.timezone)
                 due_str = local_due.strftime('%A at %I:%M %p')
             formatted_tasks.append(f"- ID {t['id']}: {t['title']} (Due: {due_str})")
@@ -216,8 +215,11 @@ class PersonalAssistantBot:
         logger.info(f"Personal Assistant Bot (Definitive Edition) started at {datetime.now(self.user_timezone)}")
     
     async def post_init(self, application: Application):
-        """Reloads pending reminders after the application has been initialized."""
+        """Reloads pending reminders and clears command menu after initialization."""
         await self.reload_pending_reminders()
+        await application.bot.delete_my_commands()
+        logger.info("Cleared any existing bot commands.")
+
 
     async def reload_pending_reminders(self):
         logger.info("Reloading pending reminders...")
@@ -227,7 +229,8 @@ class PersonalAssistantBot:
             pending_tasks = self.db.get_tasks(user['user_id'], completed=False)
             for task in pending_tasks:
                 if task.get('due_date'):
-                    await self.schedule_reminder(task['id'], task['due_date'], task['title'], task['chat_id'])
+                    # FIX: Removed incorrect 'await'
+                    self.schedule_reminder(task['id'], task['due_date'], task['title'], task['chat_id'])
                     reloaded_count += 1
         logger.info(f"Reloaded {reloaded_count} pending reminders.")
 
@@ -254,7 +257,7 @@ class PersonalAssistantBot:
             if action_type == 'create_task':
                 due_date = self.parse_due_date(action.get('due_date'))
                 new_task_id = self.db.add_task(user_id, chat_id, action['title'], due_date)
-                if due_date: await self.schedule_reminder(new_task_id, due_date, action['title'], chat_id)
+                if due_date: self.schedule_reminder(new_task_id, due_date, action['title'], chat_id)
             elif action_type == 'update_task' and task_id:
                 update_data = {k: v for k, v in action.items() if k not in ['type', 'task_id']}
                 if 'due_date' in update_data:
