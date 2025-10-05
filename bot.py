@@ -206,7 +206,6 @@ class PersonalAssistantBot:
         self.scheduler = AsyncIOScheduler(timezone=self.user_timezone)
         self.db = Database()
         self.ai = ConversationAI(gemini_api_key, self.db, self.user_timezone)
-        self.shutdown_event = asyncio.Event()
 
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.app.add_handler(MessageReactionHandler(self.handle_reaction))
@@ -299,46 +298,20 @@ class PersonalAssistantBot:
             self.db.complete_task(task_id)
             await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Done.")
 
-    async def run(self):
+    def run(self):
+        """Starts the bot and handles graceful shutdown."""
         self.app.post_init = self.post_init
         
-        async with self.app:
-            logger.info(f"Starting Personal Assistant Bot (Definitive Edition) at {datetime.now(self.user_timezone)}")
-            await self.app.start()
-            await self.shutdown_event.wait()
-            await self.app.stop()
-            self.scheduler.shutdown()
-            logger.info("Bot shut down gracefully.")
+        logger.info(f"Starting bot polling at {datetime.now(self.user_timezone)}")
+        self.app.run_polling()
 
-    async def shutdown(self):
-        self.shutdown_event.set()
 
-async def main():
+if __name__ == "__main__":
     secrets = {key: os.environ.get(key) for key in ["TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY", "DATABASE_URL"]}
     if not all(secrets.values()):
         logger.error(f"Missing environment variables! Required: {', '.join(secrets.keys())}")
-        return
-
-    bot = PersonalAssistantBot(secrets["TELEGRAM_BOT_TOKEN"], secrets["GEMINI_API_KEY"])
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.shutdown()))
-
-    await bot.run()
-
-if __name__ == "__main__":
-    lock_file = "bot.lock"
-    if os.path.exists(lock_file):
-        logger.error("Lock file exists. Another instance may be running. Exiting.")
         exit(1)
     
-    try:
-        with open(lock_file, "w") as f:
-            f.write(str(os.getpid()))
-        asyncio.run(main())
-    finally:
-        if os.path.exists(lock_file):
-            os.remove(lock_file)
-        logger.info("Lock file removed. Bot has shut down.")
+    bot = PersonalAssistantBot(secrets["TELEGRAM_BOT_TOKEN"], secrets["GEMINI_API_KEY"])
+    bot.run()
 
