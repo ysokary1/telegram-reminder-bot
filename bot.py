@@ -91,7 +91,8 @@ class Database:
             'INSERT INTO tasks (user_id, chat_id, title, due_date, created_at) VALUES (%s, %s, %s, %s, %s) RETURNING id',
             (user_id, chat_id, title, due_date, now), fetch='one'
         )
-        return result[0]
+        # FIX: The result from RealDictCursor is a dictionary. Access by key 'id'.
+        return result['id']
 
     def update_task(self, task_id: int, **kwargs):
         updates = ', '.join([f"{key} = %s" for key in kwargs])
@@ -327,3 +328,4 @@ if __name__ == "__main__":
         if bot.scheduler.running:
             bot.scheduler.shutdown()
             logger.info("Scheduler shut down.")
+
