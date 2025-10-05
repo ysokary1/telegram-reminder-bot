@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from zoneinfo import ZoneInfo
+import traceback
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -206,7 +207,7 @@ class PersonalAssistantBot:
         self.scheduler = AsyncIOScheduler(timezone=self.user_timezone)
         self.db = Database()
         self.ai = ConversationAI(gemini_api_key, self.db, self.user_timezone)
-
+        
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.app.add_handler(MessageReactionHandler(self.handle_reaction))
         
@@ -261,14 +262,16 @@ class PersonalAssistantBot:
                 self.db.update_task(task_id, **update_data)
                 
                 if update_data.get('due_date'):
-                    task = next((t for t in self.db.get_tasks(user_id) if t['id'] == task_id), None)
+                    # Fetch the full task details to get the title
+                    all_tasks = self.db.get_tasks(user_id) + self.db.get_tasks(user_id, completed=True)
+                    task = next((t for t in all_tasks if t['id'] == task_id), None)
                     if task: self.schedule_reminder(task_id, update_data['due_date'], task['title'], chat_id)
             elif action_type == 'complete_task' and task_id:
                 self.db.complete_task(task_id)
             elif action_type == 'delete_task' and task_id:
                 self.db.delete_task(task_id)
         except Exception as e:
-            logger.error(f"Action execution error ({action_type}): {e}")
+            logger.error(f"Action execution error ({action_type}): {e}\n{traceback.format_exc()}")
 
     def parse_due_date(self, due_str: Optional[str]) -> Optional[datetime]:
         if not due_str: return None
@@ -298,12 +301,34 @@ class PersonalAssistantBot:
             self.db.complete_task(task_id)
             await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Done.")
 
-    def run(self):
-        """Starts the bot and handles graceful shutdown."""
+    async def main(self):
+        """Sets up and runs the bot with graceful shutdown."""
         self.app.post_init = self.post_init
-        
-        logger.info(f"Starting bot polling at {datetime.now(self.user_timezone)}")
-        self.app.run_polling()
+
+        # Set up signal handlers for graceful shutdown
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, self.shutdown)
+
+        async with self.app:
+            await self.app.initialize()
+            await self.app.start()
+            logger.info(f"Personal Assistant Bot is running at {datetime.now(self.user_timezone)}")
+            await self.app.updater.start_polling()
+            # Keep the application running until a shutdown signal is received
+            while not self.shutdown_event.is_set():
+                await asyncio.sleep(1)
+            
+            await self.app.updater.stop()
+            await self.app.stop()
+
+    def shutdown(self):
+        """Initiates the shutdown sequence."""
+        logger.info("Shutdown signal received. Shutting down gracefully...")
+        self.shutdown_event.set()
+        if self.scheduler.running:
+            self.scheduler.shutdown()
+            logger.info("Scheduler shut down.")
 
 
 if __name__ == "__main__":
@@ -313,5 +338,9 @@ if __name__ == "__main__":
         exit(1)
     
     bot = PersonalAssistantBot(secrets["TELEGRAM_BOT_TOKEN"], secrets["GEMINI_API_KEY"])
-    bot.run()
+    
+    try:
+        asyncio.run(bot.main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot execution stopped.")
 
