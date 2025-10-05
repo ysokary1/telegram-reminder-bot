@@ -207,7 +207,8 @@ class PersonalAssistantBot:
         self.scheduler = AsyncIOScheduler(timezone=self.user_timezone)
         self.db = Database()
         self.ai = ConversationAI(gemini_api_key, self.db, self.user_timezone)
-        
+        self.shutdown_event = asyncio.Event() # FIX: Initialize the shutdown_event
+
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.app.add_handler(MessageReactionHandler(self.handle_reaction))
         
@@ -305,30 +306,30 @@ class PersonalAssistantBot:
         """Sets up and runs the bot with graceful shutdown."""
         self.app.post_init = self.post_init
 
-        # Set up signal handlers for graceful shutdown
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self.shutdown)
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
 
-        async with self.app:
-            await self.app.initialize()
-            await self.app.start()
-            logger.info(f"Personal Assistant Bot is running at {datetime.now(self.user_timezone)}")
-            await self.app.updater.start_polling()
-            # Keep the application running until a shutdown signal is received
-            while not self.shutdown_event.is_set():
-                await asyncio.sleep(1)
-            
-            await self.app.updater.stop()
-            await self.app.stop()
+        logger.info(f"Starting Personal Assistant Bot at {datetime.now(self.user_timezone)}")
+        
+        # This will run the bot until a shutdown signal is received
+        await self.app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
 
-    def shutdown(self):
+
+    async def shutdown(self):
         """Initiates the shutdown sequence."""
         logger.info("Shutdown signal received. Shutting down gracefully...")
-        self.shutdown_event.set()
         if self.scheduler.running:
             self.scheduler.shutdown()
             logger.info("Scheduler shut down.")
+        
+        # This tells run_polling to stop
+        await self.app.updater.stop()
+        await self.app.stop()
+        
+        # Allow time for pending tasks to complete
+        await asyncio.sleep(2)
+        logger.info("Bot has been shut down.")
 
 
 if __name__ == "__main__":
@@ -342,5 +343,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(bot.main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot execution stopped.")
+        logger.info("Bot execution stopped manually.")
 
