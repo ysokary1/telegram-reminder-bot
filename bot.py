@@ -111,7 +111,9 @@ class Database:
         self._execute_query('DELETE FROM conversation_history WHERE id IN (SELECT id FROM conversation_history WHERE user_id = %s ORDER BY timestamp DESC OFFSET 20)', (user_id,))
     
     def get_recent_messages(self, user_id: int, limit: int = 12) -> List[Dict]:
-        return self._execute_query('SELECT role, message FROM conversation_history WHERE user_id = %s ORDER BY timestamp DESC LIMIT %s', (user_id, limit), fetch='all')
+        results = self._execute_query('SELECT role, message FROM conversation_history WHERE user_id = %s ORDER BY timestamp DESC LIMIT %s', (user_id, limit), fetch='all')
+        return list(reversed(results))
+
 
     def store_message_task_map(self, message_id: int, task_id: int):
         self._execute_query('INSERT INTO message_task_map (message_id, task_id) VALUES (%s, %s) ON CONFLICT (message_id) DO UPDATE SET task_id = EXCLUDED.task_id', (message_id, task_id))
@@ -126,39 +128,49 @@ class Database:
 
 
 class ConversationAI:
-    def __init__(self, api_key: str, db: Database):
+    def __init__(self, api_key: str, db: Database, timezone: ZoneInfo):
         self.api_key = api_key
         self.db = db
+        self.timezone = timezone
         self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={self.api_key}"
 
     def _format_tasks(self, tasks: List[Dict], title: str) -> str:
         if not tasks: return f"{title}:\n- None"
-        formatted = [f"- ID {t['id']}: {t['title']} (Due: {t['due_date'].strftime('%A at %I:%M %p') if t['due_date'] else 'Not scheduled'})" for t in tasks]
-        return f"{title}:\n" + "\n".join(formatted)
+        
+        formatted_tasks = []
+        for t in tasks:
+            due_str = 'Not scheduled'
+            if t['due_date']:
+                # Convert UTC time from DB to local timezone for display
+                local_due = t['due_date'].astimezone(self.timezone)
+                due_str = local_due.strftime('%A at %I:%M %p')
+            formatted_tasks.append(f"- ID {t['id']}: {t['title']} (Due: {due_str})")
+            
+        return f"{title}:\n" + "\n".join(formatted_tasks)
 
     async def process_message(self, user_id: int, message: str) -> Dict:
         active_tasks = self.db.get_tasks(user_id)
         last_completed = self.db.get_tasks(user_id, completed=True, limit=1)
         history = self.db.get_recent_messages(user_id)
         
-        system_prompt = f"""You are a hyper-intelligent, proactive personal assistant. Your primary function is to manage tasks and conversations with state-aware logic, reducing the user's mental load.
+        system_prompt = f"""You are a hyper-intelligent, proactive personal assistant. Your primary function is to manage tasks and conversations with state-aware logic, reducing the user's mental load. You are concise and sound like a natural human.
 
-Current time: {datetime.now(ZoneInfo('Europe/London')).isoformat()}
+Current time: {datetime.now(self.timezone).isoformat()}
 
 **CONTEXTUAL BRIEFING (Source of Truth):**
 {self._format_tasks(active_tasks, "ACTIVE TASKS")}
 {self._format_tasks(last_completed, "LAST COMPLETED TASK")}
 
 **CORE DIRECTIVES (NON-NEGOTIABLE):**
-1.  **State Management is Key:** If a user's request modifies an existing task (e.g., "change that to 12pm", "reschedule my appointment"), you MUST use the `update_task` action with the correct `task_id`. DO NOT create a new task.
-2.  **Be Proactive:** If a task is created without a specific time (e.g., "on Monday"), you MUST ask for clarification.
+1.  **State Management is Key:** If a user's request modifies an existing task (e.g., "change that to 12pm"), you MUST use the `update_task` action. DO NOT create a duplicate task.
+2.  **Be Proactive & Infer:** If a task is created without a specific time (e.g., "on Monday"), you MUST ask for clarification. If a time is given without a date ("at 10"), assume it's for today or the soonest logical future time. Ask simple, direct questions (e.g., "10 AM or PM?").
 3.  **Use Full Context:** Your response MUST be informed by the conversation history AND the task lists.
 4.  **Prioritize Recent Actions:** When asked "what did I just finish?", your answer MUST be based ONLY on the 'LAST COMPLETED TASK'.
 5.  **JSON Output Only:** Your entire response must be a single, valid JSON object.
 
 **RESPONSE FORMAT (JSON ONLY):**
 {{
-  "reply": "Your concise, intelligent, and proactive response.",
+  "reply": "Your concise, intelligent, and natural response.",
   "actions": [
     {{"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SS+01:00"}},
     {{"type": "update_task", "task_id": 123, "title": "(optional)", "due_date": "(optional)"}},
@@ -173,7 +185,7 @@ Current time: {datetime.now(ZoneInfo('Europe/London')).isoformat()}
         payload = {
             "contents": contents,
             "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "generationConfig": {"response_mime_type": "application/json", "temperature": 0.1}
+            "generationConfig": {"response_mime_type": "application/json", "temperature": 0.2}
         }
         
         try:
@@ -192,17 +204,33 @@ Current time: {datetime.now(ZoneInfo('Europe/London')).isoformat()}
 class PersonalAssistantBot:
     def __init__(self, telegram_token: str, gemini_api_key: str):
         self.app = Application.builder().token(telegram_token).build()
-        self.scheduler = AsyncIOScheduler(timezone='Europe/London')
-        self.db = Database()
-        self.ai = ConversationAI(gemini_api_key, self.db)
         self.user_timezone = ZoneInfo('Europe/London')
+        self.scheduler = AsyncIOScheduler(timezone=self.user_timezone)
+        self.db = Database()
+        self.ai = ConversationAI(gemini_api_key, self.db, self.user_timezone)
         
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.app.add_handler(MessageReactionHandler(self.handle_reaction))
         
         self.scheduler.start()
-        logger.info(f"Personal Assistant Bot (State-Aware Edition) started at {datetime.now(self.user_timezone)}")
+        logger.info(f"Personal Assistant Bot (Definitive Edition) started at {datetime.now(self.user_timezone)}")
     
+    async def post_init(self, application: Application):
+        """Reloads pending reminders after the application has been initialized."""
+        await self.reload_pending_reminders()
+
+    async def reload_pending_reminders(self):
+        logger.info("Reloading pending reminders...")
+        reloaded_count = 0
+        users = self.db.get_active_users()
+        for user in users:
+            pending_tasks = self.db.get_tasks(user['user_id'], completed=False)
+            for task in pending_tasks:
+                if task.get('due_date'):
+                    await self.schedule_reminder(task['id'], task['due_date'], task['title'], task['chat_id'])
+                    reloaded_count += 1
+        logger.info(f"Reloaded {reloaded_count} pending reminders.")
+
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user, chat, message = update.effective_user, update.effective_chat, update.message.text
         self.db.register_user(user.id, chat.id)
@@ -217,28 +245,25 @@ class PersonalAssistantBot:
         sent_message = await update.message.reply_text(reply)
         
         for action in result.get('actions', []):
-            await self.execute_action(user.id, chat.id, action, sent_message)
+            await self.execute_action(user.id, chat.id, action)
 
-    async def execute_action(self, user_id: int, chat_id: int, action: Dict, message: Update.message):
+    async def execute_action(self, user_id: int, chat_id: int, action: Dict):
         action_type = action.get('type')
         task_id = action.get('task_id')
         try:
             if action_type == 'create_task':
                 due_date = self.parse_due_date(action.get('due_date'))
                 new_task_id = self.db.add_task(user_id, chat_id, action['title'], due_date)
-                if due_date: self.schedule_reminder(new_task_id, due_date, action['title'], chat_id)
+                if due_date: await self.schedule_reminder(new_task_id, due_date, action['title'], chat_id)
             elif action_type == 'update_task' and task_id:
                 update_data = {k: v for k, v in action.items() if k not in ['type', 'task_id']}
                 if 'due_date' in update_data:
                     update_data['due_date'] = self.parse_due_date(update_data['due_date'])
                 self.db.update_task(task_id, **update_data)
                 
-                # Reschedule reminder if date changed
                 if update_data.get('due_date'):
-                    tasks = self.db.get_tasks(user_id, completed=False)
-                    task_to_reschedule = next((t for t in tasks if t['id'] == task_id), None)
-                    if task_to_reschedule:
-                        self.schedule_reminder(task_id, update_data['due_date'], task_to_reschedule['title'], chat_id)
+                    task = next((t for t in self.db.get_tasks(user_id) if t['id'] == task_id), None)
+                    if task: self.schedule_reminder(task_id, update_data['due_date'], task['title'], chat_id)
             elif action_type == 'complete_task' and task_id:
                 self.db.complete_task(task_id)
             elif action_type == 'delete_task' and task_id:
@@ -252,7 +277,7 @@ class PersonalAssistantBot:
         except: return None
     
     def schedule_reminder(self, task_id: int, due_date: datetime, title: str, chat_id: int):
-        aware_due = due_date.astimezone(self.user_timezone) if due_date.tzinfo else self.user_timezone.localize(due_date)
+        aware_due = due_date if due_date.tzinfo else self.user_timezone.localize(due_date)
         if aware_due > datetime.now(self.user_timezone):
             self.scheduler.add_job(self.send_task_reminder, DateTrigger(run_date=aware_due),
                                    args=[chat_id, title, task_id], id=f"task_{task_id}", replace_existing=True)
@@ -270,6 +295,7 @@ class PersonalAssistantBot:
             await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Done.")
 
     def run(self):
+        self.app.post_init = self.post_init
         self.app.run_polling()
 
 if __name__ == "__main__":
@@ -280,4 +306,3 @@ if __name__ == "__main__":
     
     bot = PersonalAssistantBot(secrets["TELEGRAM_BOT_TOKEN"], secrets["GEMINI_API_KEY"])
     bot.run()
-
