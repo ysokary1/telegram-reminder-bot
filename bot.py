@@ -1,7 +1,6 @@
 import os
 import json
 import logging
-import random
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from zoneinfo import ZoneInfo
@@ -11,7 +10,6 @@ from psycopg2.extras import RealDictCursor
 from telegram import Update
 from telegram.ext import Application, MessageHandler, MessageReactionHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 import httpx
 
@@ -114,7 +112,6 @@ class Database:
         results = self._execute_query('SELECT role, message FROM conversation_history WHERE user_id = %s ORDER BY timestamp DESC LIMIT %s', (user_id, limit), fetch='all')
         return list(reversed(results))
 
-
     def store_message_task_map(self, message_id: int, task_id: int):
         self._execute_query('INSERT INTO message_task_map (message_id, task_id) VALUES (%s, %s) ON CONFLICT (message_id) DO UPDATE SET task_id = EXCLUDED.task_id', (message_id, task_id))
 
@@ -211,15 +208,14 @@ class PersonalAssistantBot:
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.app.add_handler(MessageReactionHandler(self.handle_reaction))
         
-        self.scheduler.start()
-        logger.info(f"Personal Assistant Bot (Definitive Edition) started at {datetime.now(self.user_timezone)}")
-    
     async def post_init(self, application: Application):
-        """Reloads pending reminders and clears command menu after initialization."""
+        """Starts scheduler, reloads reminders, and clears commands."""
+        if not self.scheduler.running:
+            self.scheduler.start()
+            logger.info("Scheduler started.")
         await self.reload_pending_reminders()
         await application.bot.delete_my_commands()
         logger.info("Cleared any existing bot commands.")
-
 
     async def reload_pending_reminders(self):
         logger.info("Reloading pending reminders...")
@@ -229,7 +225,6 @@ class PersonalAssistantBot:
             pending_tasks = self.db.get_tasks(user['user_id'], completed=False)
             for task in pending_tasks:
                 if task.get('due_date'):
-                    # FIX: Removed incorrect 'await'
                     self.schedule_reminder(task['id'], task['due_date'], task['title'], task['chat_id'])
                     reloaded_count += 1
         logger.info(f"Reloaded {reloaded_count} pending reminders.")
@@ -245,7 +240,7 @@ class PersonalAssistantBot:
         reply = result.get('reply', 'Understood.')
         
         self.db.add_message(user.id, "assistant", reply)
-        sent_message = await update.message.reply_text(reply)
+        await update.message.reply_text(reply)
         
         for action in result.get('actions', []):
             await self.execute_action(user.id, chat.id, action)
@@ -280,16 +275,20 @@ class PersonalAssistantBot:
         except: return None
     
     def schedule_reminder(self, task_id: int, due_date: datetime, title: str, chat_id: int):
-        # FIX: Use .replace(tzinfo=...) for zoneinfo, not .localize()
         aware_due = due_date if due_date.tzinfo else due_date.replace(tzinfo=self.user_timezone)
         if aware_due > datetime.now(self.user_timezone):
             self.scheduler.add_job(self.send_task_reminder, DateTrigger(run_date=aware_due),
                                    args=[chat_id, title, task_id], id=f"task_{task_id}", replace_existing=True)
+            logger.info(f"Scheduled reminder for task {task_id} ('{title}') at {aware_due.strftime('%Y-%m-%d %H:%M:%S')}")
 
     async def send_task_reminder(self, chat_id: int, title: str, task_id: int):
-        message = f"⏰ Reminder: {title}"
-        sent_message = await self.app.bot.send_message(chat_id=chat_id, text=message)
-        self.db.store_message_task_map(sent_message.message_id, task_id)
+        try:
+            message = f"⏰ Reminder: {title}"
+            sent_message = await self.app.bot.send_message(chat_id=chat_id, text=message)
+            self.db.store_message_task_map(sent_message.message_id, task_id)
+            logger.info(f"Successfully sent reminder for task {task_id} to chat {chat_id}.")
+        except Exception as e:
+            logger.error(f"Failed to send reminder for task {task_id} to chat {chat_id}: {e}")
 
     async def handle_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message_reaction or not update.message_reaction.new_reaction: return
@@ -299,6 +298,7 @@ class PersonalAssistantBot:
             await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Done.")
 
     def run(self):
+        logger.info(f"Starting Personal Assistant Bot (Definitive Edition) at {datetime.now(self.user_timezone)}")
         self.app.post_init = self.post_init
         self.app.run_polling()
 
