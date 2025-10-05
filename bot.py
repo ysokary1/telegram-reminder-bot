@@ -277,7 +277,8 @@ class PersonalAssistantBot:
         except: return None
     
     def schedule_reminder(self, task_id: int, due_date: datetime, title: str, chat_id: int):
-        aware_due = due_date if due_date.tzinfo else self.user_timezone.localize(due_date)
+        # FIX: Use .replace(tzinfo=...) for zoneinfo, not .localize()
+        aware_due = due_date if due_date.tzinfo else due_date.replace(tzinfo=self.user_timezone)
         if aware_due > datetime.now(self.user_timezone):
             self.scheduler.add_job(self.send_task_reminder, DateTrigger(run_date=aware_due),
                                    args=[chat_id, title, task_id], id=f"task_{task_id}", replace_existing=True)
@@ -306,3 +307,4 @@ if __name__ == "__main__":
     
     bot = PersonalAssistantBot(secrets["TELEGRAM_BOT_TOKEN"], secrets["GEMINI_API_KEY"])
     bot.run()
+
