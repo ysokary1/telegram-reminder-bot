@@ -10,10 +10,11 @@ import traceback
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from telegram import Update
-from telegram.ext import Application, MessageHandler, MessageReactionHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, MessageReactionHandler, filters, ContextTypes, CallbackQueryHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.cron import CronTrigger
 import httpx
 
 logging.basicConfig(
@@ -35,15 +36,11 @@ class Database:
     def init_db(self):
         with self.get_connection() as conn:
             with conn.cursor() as cursor:
-                # --- TEMPORARY MIGRATION CODE START ---
-                # This block will run once to fix your outdated table by removing extra columns.
                 try:
                     cursor.execute('ALTER TABLE message_task_map DROP COLUMN chat_id, DROP COLUMN created_at;')
                     logger.info("Successfully migrated message_task_map table structure.")
                 except psycopg2.Error:
-                    # This is expected to fail on subsequent runs after the columns are gone.
                     conn.rollback()
-                # --- TEMPORARY MIGRATION CODE END ---
 
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS tasks (
@@ -103,6 +100,24 @@ class Database:
             query += ' LIMIT %s'
             params.append(limit)
         return self._execute_query(query, params, fetch='all')
+
+    def get_task_by_id(self, task_id: int) -> Optional[Dict]:
+        return self._execute_query('SELECT * FROM tasks WHERE id = %s', (task_id,), fetch='one')
+
+    def get_tasks_for_today(self, user_id: int) -> List[Dict]:
+        now = datetime.now(ZoneInfo('Europe/London'))
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = start_of_day + timedelta(days=1)
+        
+        query = """
+            SELECT * FROM tasks 
+            WHERE user_id = %s 
+            AND completed = 0 
+            AND due_date >= %s 
+            AND due_date < %s
+            ORDER BY due_date ASC
+        """
+        return self._execute_query(query, (user_id, start_of_day, end_of_day), fetch='all')
 
     def add_task(self, user_id: int, chat_id: int, title: str, due_date: Optional[datetime] = None) -> int:
         now = datetime.now(ZoneInfo('Europe/London'))
@@ -198,6 +213,7 @@ Current time: {datetime.now(self.timezone).isoformat()}
 3.  **Use Full Context:** Your response MUST be informed by conversation history, tasks, AND personal facts.
 4.  **Date/Time Formatting:** All `due_date` fields MUST be in UTC ISO 8601 format, ending with 'Z'. Example: "2025-10-27T14:30:00Z".
 5.  **JSON Output Only:** Your entire response must be a single, valid JSON object.
+6.  **Always Clarify Timing:** For every new task, you MUST ask for a due date unless the user explicitly says it's not needed (e.g., "add milk to my shopping list"). Ask simple, direct questions like, "When should I set that for?"
 
 **RESPONSE FORMAT (JSON ONLY):**
 {{
@@ -243,12 +259,22 @@ class PersonalAssistantBot:
 
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.app.add_handler(MessageReactionHandler(self.handle_reaction))
+        self.app.add_handler(CallbackQueryHandler(self.handle_button_press))
         
     async def post_init(self, application: Application):
         if not self.scheduler.running:
             self.scheduler.start()
             logger.info("Scheduler started.")
         await self.reload_pending_reminders()
+        
+        self.scheduler.add_job(
+            self.run_daily_briefings,
+            trigger=CronTrigger(hour=8, minute=0, timezone=self.user_timezone),
+            id="daily_briefing_job",
+            replace_existing=True
+        )
+        logger.info("Scheduled daily briefing job for 8:00 AM.")
+
         await application.bot.delete_my_commands()
         logger.info("Cleared any existing bot commands.")
 
@@ -263,6 +289,47 @@ class PersonalAssistantBot:
                     self.schedule_reminder(task['id'], task['due_date'], task['title'], task['chat_id'])
                     reloaded_count += 1
         logger.info(f"Reloaded {reloaded_count} pending reminders.")
+
+    async def run_daily_briefings(self):
+        logger.info("Running daily briefing job for all active users...")
+        users = self.db.get_active_users()
+        for user in users:
+            await self.send_daily_briefing(user['user_id'], user['chat_id'])
+        logger.info(f"Daily briefing job completed for {len(users)} users.")
+
+    async def send_daily_briefing(self, user_id: int, chat_id: int):
+        try:
+            tasks = self.db.get_tasks_for_today(user_id)
+            if not tasks:
+                await self.app.bot.send_message(chat_id, "Good morning! ☀️ You have no tasks scheduled for today. Have a great one!")
+                return
+            
+            task_list_str = ""
+            for task in tasks:
+                time_str = task['due_date'].astimezone(self.user_timezone).strftime('%I:%M %p')
+                task_list_str += f"- {task['title']} (Due: {time_str})\n"
+
+            briefing_prompt = f"""You are a world-class executive assistant. Your tone is friendly, professional, and slightly motivational.
+Summarize the following list of tasks for the user's morning briefing. Group them logically if possible (e.g., by time or project). Keep it concise.
+
+Today's tasks:
+{task_list_str}
+"""
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                payload = {
+                    "contents": [{"parts": [{"text": briefing_prompt}]}],
+                    "generationConfig": {"temperature": 0.3}
+                }
+                response = await client.post(self.ai.base_url, json=payload)
+                response.raise_for_status()
+                result = response.json()
+                summary = result['candidates'][0]['content']['parts'][0]['text']
+                
+                final_message = f"Good morning! ☀️ Here's your daily briefing:\n\n{summary}"
+                await self.app.bot.send_message(chat_id, final_message)
+
+        except Exception as e:
+            logger.error(f"Failed to send daily briefing to user {user_id}: {e}")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user, chat, message = update.effective_user, update.effective_chat, update.message.text
@@ -295,8 +362,7 @@ class PersonalAssistantBot:
                 self.db.update_task(task_id, **update_data)
                 
                 if update_data.get('due_date'):
-                    all_tasks = self.db.get_tasks(user_id) + self.db.get_tasks(user_id, completed=True)
-                    task = next((t for t in all_tasks if t['id'] == task_id), None)
+                    task = self.db.get_task_by_id(task_id)
                     if task: self.schedule_reminder(task_id, update_data['due_date'], task['title'], chat_id)
             elif action_type == 'complete_task' and task_id:
                 self.db.complete_task(task_id)
@@ -340,29 +406,49 @@ class PersonalAssistantBot:
 
     async def send_task_reminder(self, chat_id: int, title: str, task_id: int):
         try:
-            message = f"⏰ Reminder: {title}"
-            sent_message = await self.app.bot.send_message(chat_id=chat_id, text=message)
-            self.db.store_message_task_map(sent_message.message_id, task_id)
-            logger.info(f"Successfully sent reminder for task {task_id} to chat {chat_id}.")
+            keyboard = [
+                [
+                    InlineKeyboardButton("Done ✅", callback_data=f"complete:{task_id}"),
+                    InlineKeyboardButton("Snooze 5min  snooze", callback_data=f"snooze:{task_id}"),
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            message_text = f"⏰ Reminder: {title}"
+            sent_message = await self.app.bot.send_message(
+                chat_id=chat_id, text=message_text, reply_markup=reply_markup
+            )
+            logger.info(f"Successfully sent reminder with buttons for task {task_id} to chat {chat_id}.")
         except Exception as e:
-            logger.error(f"Failed to save reminder map for task {task_id}: {e}")
+            logger.error(f"Failed to send reminder for task {task_id}: {e}")
 
-    async def handle_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message_reaction or not update.message_reaction.new_reaction: return
-        
-        message_id = update.message_reaction.message_id
-        chat_id = update.effective_chat.id
-        logger.info(f"Received reaction for message {message_id} in chat {chat_id}")
+    async def handle_button_press(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
 
-        task_id = self.db.get_task_from_message(message_id)
-        if not task_id:
-            logger.warning(f"No associated task found for message {message_id}")
+        action, task_id_str = query.data.split(":")
+        task_id = int(task_id_str)
+
+        task = self.db.get_task_by_id(task_id)
+        if not task:
+            await query.edit_message_text(text=f"This task no longer exists.")
             return
 
-        if any(r.emoji in ['👍', '✅'] for r in update.message_reaction.new_reaction):
-            logger.info(f"Completing task {task_id} due to user reaction.")
+        if action == "complete":
             self.db.complete_task(task_id)
-            await context.bot.send_message(chat_id=chat_id, text="✅ Done.")
+            await query.edit_message_text(text=f"✅ Done: {task['title']}")
+            logger.info(f"Completed task {task_id} via button press.")
+        
+        elif action == "snooze":
+            new_due_date = datetime.now(self.user_timezone) + timedelta(minutes=5)
+            self.db.update_task(task_id, due_date=new_due_date)
+            self.schedule_reminder(task_id, new_due_date, task['title'], task['chat_id'])
+            await query.edit_message_text(text=f" snooze Snoozed for 5 minutes: {task['title']}")
+            logger.info(f"Snoozed task {task_id} for 5 minutes via button press.")
+
+    async def handle_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info(f"Ignoring reaction, as buttons are the primary method for task completion.")
+        return
 
     def run(self):
         self.app.post_init = self.post_init
