@@ -60,7 +60,6 @@ class Database:
                         message_id BIGINT PRIMARY KEY, task_id INTEGER NOT NULL
                     )
                 ''')
-                # NEW: Table for personal facts
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS user_facts (
                         id SERIAL PRIMARY KEY,
@@ -136,9 +135,7 @@ class Database:
         cutoff = datetime.now(ZoneInfo('Europe/London')) - timedelta(days=7)
         return self._execute_query('SELECT user_id, chat_id FROM active_users WHERE last_interaction > %s', (cutoff,), fetch='all')
 
-    # NEW: Methods for handling personal facts
     def add_user_fact(self, user_id: int, key: str, value: str):
-        """Saves or updates a personal fact for a user."""
         now = datetime.now(ZoneInfo('Europe/London'))
         self._execute_query(
             'INSERT INTO user_facts (user_id, fact_key, fact_value, created_at) VALUES (%s, %s, %s, %s) ON CONFLICT (user_id, fact_key) DO UPDATE SET fact_value = EXCLUDED.fact_value',
@@ -146,7 +143,6 @@ class Database:
         )
 
     def get_user_facts(self, user_id: int) -> List[Dict]:
-        """Retrieves all personal facts for a user."""
         return self._execute_query(
             'SELECT fact_key, fact_value FROM user_facts WHERE user_id = %s ORDER BY fact_key',
             (user_id,),
@@ -166,7 +162,6 @@ class ConversationAI:
         formatted_tasks = [f"- ID {t['id']}: {t['title']} (Due: {t['due_date'].astimezone(self.timezone).strftime('%A at %I:%M %p (%d %b)') if t['due_date'] else 'Not scheduled'})" for t in tasks]
         return f"{title}:\n" + "\n".join(formatted_tasks)
     
-    # NEW: Helper to format facts for the prompt
     def _format_facts(self, facts: List[Dict]) -> str:
         if not facts: return "PERSONAL FACTS:\n- None"
         formatted_facts = [f"- {fact['fact_key']}: {fact['fact_value']}" for fact in facts]
@@ -176,10 +171,8 @@ class ConversationAI:
         active_tasks = self.db.get_tasks(user_id)
         last_completed = self.db.get_tasks(user_id, completed=True, limit=1)
         history = self.db.get_recent_messages(user_id)
-        # MODIFIED: Get user facts to include in the prompt
         user_facts = self.db.get_user_facts(user_id)
         
-        # MODIFIED: Updated system prompt with facts and new action
         system_prompt = f"""You are a hyper-intelligent, proactive personal assistant. Your primary function is to manage tasks and conversations with state-aware logic, reducing the user's mental load. You are concise and sound like a natural human.
 
 Current time: {datetime.now(self.timezone).isoformat()}
@@ -299,7 +292,6 @@ class PersonalAssistantBot:
                 self.db.complete_task(task_id)
             elif action_type == 'delete_task' and task_id:
                 self.db.delete_task(task_id)
-            # NEW: Handle the remember_fact action
             elif action_type == 'remember_fact' and 'key' in action and 'value' in action:
                 self.db.add_user_fact(user_id, action['key'], action['value'])
                 logger.info(f"Remembered new fact for user {user_id}: {action['key']}")
@@ -316,7 +308,8 @@ class PersonalAssistantBot:
             return None
     
     def schedule_reminder(self, task_id: int, due_date: datetime, title: str, chat_id: int):
-        aware_due = due_date if due_date.tzinfo else self.user_timezone.localize(due_date)
+        # FIX: Use .replace(tzinfo=...) for zoneinfo instead of .localize(...)
+        aware_due = due_date if due_date.tzinfo else due_date.replace(tzinfo=self.user_timezone)
         now_aware = datetime.now(self.user_timezone)
 
         if aware_due > now_aware:
