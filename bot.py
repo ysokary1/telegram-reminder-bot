@@ -155,7 +155,8 @@ class ConversationAI:
         self.api_key = api_key
         self.db = db
         self.timezone = timezone
-        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={self.api_key}"
+        # FIX: Corrected the model name by removing '-latest'
+        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={self.api_key}"
 
     def _format_tasks(self, tasks: List[Dict], title: str) -> str:
         if not tasks: return f"{title}:\n- None"
@@ -308,7 +309,6 @@ class PersonalAssistantBot:
             return None
     
     def schedule_reminder(self, task_id: int, due_date: datetime, title: str, chat_id: int):
-        # FIX: Use .replace(tzinfo=...) for zoneinfo instead of .localize(...)
         aware_due = due_date if due_date.tzinfo else due_date.replace(tzinfo=self.user_timezone)
         now_aware = datetime.now(self.user_timezone)
 
