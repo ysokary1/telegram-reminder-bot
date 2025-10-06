@@ -155,8 +155,8 @@ class ConversationAI:
         self.api_key = api_key
         self.db = db
         self.timezone = timezone
-        # FIX: Using the standard 'gemini-pro' model for maximum compatibility.
-        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={self.api_key}"
+        # REVERTED: Using the 2.5 preview model as requested by the user.
+        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={self.api_key}"
 
     def _format_tasks(self, tasks: List[Dict], title: str) -> str:
         if not tasks: return f"{title}:\n- None"
