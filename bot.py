@@ -409,7 +409,7 @@ Today's tasks:
             keyboard = [
                 [
                     InlineKeyboardButton("Done ✅", callback_data=f"complete:{task_id}"),
-                    InlineKeyboardButton("Snooze 5min  snooze", callback_data=f"snooze:{task_id}"),
+                    InlineKeyboardButton("Snooze 5min", callback_data=f"snooze:{task_id}"),
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
