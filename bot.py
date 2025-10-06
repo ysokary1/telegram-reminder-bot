@@ -35,6 +35,16 @@ class Database:
     def init_db(self):
         with self.get_connection() as conn:
             with conn.cursor() as cursor:
+                # --- TEMPORARY MIGRATION CODE START ---
+                # This block will run once to fix your outdated table by removing extra columns.
+                try:
+                    cursor.execute('ALTER TABLE message_task_map DROP COLUMN chat_id, DROP COLUMN created_at;')
+                    logger.info("Successfully migrated message_task_map table structure.")
+                except psycopg2.Error:
+                    # This is expected to fail on subsequent runs after the columns are gone.
+                    conn.rollback()
+                # --- TEMPORARY MIGRATION CODE END ---
+
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS tasks (
                         id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, chat_id BIGINT NOT NULL,
@@ -308,12 +318,9 @@ class PersonalAssistantBot:
             return None
     
     def schedule_reminder(self, task_id: int, due_date: datetime, title: str, chat_id: int):
-        # FIX: This block correctly handles timezone-naive datetimes from the database.
-        # 1. If the datetime is naive (no timezone), we explicitly set it to UTC.
         if not due_date.tzinfo:
             due_date = due_date.replace(tzinfo=ZoneInfo('UTC'))
 
-        # 2. We then convert the (now guaranteed aware) due_date to the user's local timezone.
         aware_due = due_date.astimezone(self.user_timezone)
         
         now_aware = datetime.now(self.user_timezone)
@@ -338,7 +345,7 @@ class PersonalAssistantBot:
             self.db.store_message_task_map(sent_message.message_id, task_id)
             logger.info(f"Successfully sent reminder for task {task_id} to chat {chat_id}.")
         except Exception as e:
-            logger.error(f"Failed to send reminder for task {task_id} to chat {chat_id}: {e}")
+            logger.error(f"Failed to save reminder map for task {task_id}: {e}")
 
     async def handle_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message_reaction or not update.message_reaction.new_reaction: return
