@@ -155,7 +155,6 @@ class ConversationAI:
         self.api_key = api_key
         self.db = db
         self.timezone = timezone
-        # REVERTED: Using the 2.5 preview model as requested by the user.
         self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={self.api_key}"
 
     def _format_tasks(self, tasks: List[Dict], title: str) -> str:
@@ -309,7 +308,14 @@ class PersonalAssistantBot:
             return None
     
     def schedule_reminder(self, task_id: int, due_date: datetime, title: str, chat_id: int):
-        aware_due = due_date if due_date.tzinfo else due_date.replace(tzinfo=self.user_timezone)
+        # FIX: This block correctly handles timezone-naive datetimes from the database.
+        # 1. If the datetime is naive (no timezone), we explicitly set it to UTC.
+        if not due_date.tzinfo:
+            due_date = due_date.replace(tzinfo=ZoneInfo('UTC'))
+
+        # 2. We then convert the (now guaranteed aware) due_date to the user's local timezone.
+        aware_due = due_date.astimezone(self.user_timezone)
+        
         now_aware = datetime.now(self.user_timezone)
 
         if aware_due > now_aware:
