@@ -17,14 +17,13 @@ from apscheduler.triggers.date import DateTrigger
 import httpx
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s] - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 
 class Database:
-    """Handles all database operations for the assistant."""
     def __init__(self):
         self.database_url = os.environ.get("DATABASE_URL")
         if not self.database_url: raise ValueError("DATABASE_URL not set")
@@ -61,6 +60,17 @@ class Database:
                         message_id BIGINT PRIMARY KEY, task_id INTEGER NOT NULL
                     )
                 ''')
+                # NEW: Table for personal facts
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_facts (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        fact_key TEXT NOT NULL,
+                        fact_value TEXT NOT NULL,
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                        UNIQUE(user_id, fact_key)
+                    )
+                ''')
 
     def _execute_query(self, query, params=None, fetch=None):
         with self.get_connection() as conn:
@@ -91,7 +101,6 @@ class Database:
             'INSERT INTO tasks (user_id, chat_id, title, due_date, created_at) VALUES (%s, %s, %s, %s, %s) RETURNING id',
             (user_id, chat_id, title, due_date, now), fetch='one'
         )
-        # FIX: The result from RealDictCursor is a dictionary. Access by key 'id'.
         return result['id']
 
     def update_task(self, task_id: int, **kwargs):
@@ -121,11 +130,28 @@ class Database:
 
     def get_task_from_message(self, message_id: int) -> Optional[int]:
         result = self._execute_query('SELECT task_id FROM message_task_map WHERE message_id = %s', (message_id,), fetch='one')
-        return result[0] if result else None
+        return result['task_id'] if result else None
     
     def get_active_users(self) -> List[Dict]:
         cutoff = datetime.now(ZoneInfo('Europe/London')) - timedelta(days=7)
         return self._execute_query('SELECT user_id, chat_id FROM active_users WHERE last_interaction > %s', (cutoff,), fetch='all')
+
+    # NEW: Methods for handling personal facts
+    def add_user_fact(self, user_id: int, key: str, value: str):
+        """Saves or updates a personal fact for a user."""
+        now = datetime.now(ZoneInfo('Europe/London'))
+        self._execute_query(
+            'INSERT INTO user_facts (user_id, fact_key, fact_value, created_at) VALUES (%s, %s, %s, %s) ON CONFLICT (user_id, fact_key) DO UPDATE SET fact_value = EXCLUDED.fact_value',
+            (user_id, key.lower(), value, now)
+        )
+
+    def get_user_facts(self, user_id: int) -> List[Dict]:
+        """Retrieves all personal facts for a user."""
+        return self._execute_query(
+            'SELECT fact_key, fact_value FROM user_facts WHERE user_id = %s ORDER BY fact_key',
+            (user_id,),
+            fetch='all'
+        )
 
 
 class ConversationAI:
@@ -133,26 +159,27 @@ class ConversationAI:
         self.api_key = api_key
         self.db = db
         self.timezone = timezone
-        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={self.api_key}"
+        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={self.api_key}"
 
     def _format_tasks(self, tasks: List[Dict], title: str) -> str:
         if not tasks: return f"{title}:\n- None"
-        
-        formatted_tasks = []
-        for t in tasks:
-            due_str = 'Not scheduled'
-            if t['due_date']:
-                local_due = t['due_date'].astimezone(self.timezone)
-                due_str = local_due.strftime('%A at %I:%M %p')
-            formatted_tasks.append(f"- ID {t['id']}: {t['title']} (Due: {due_str})")
-            
+        formatted_tasks = [f"- ID {t['id']}: {t['title']} (Due: {t['due_date'].astimezone(self.timezone).strftime('%A at %I:%M %p (%d %b)') if t['due_date'] else 'Not scheduled'})" for t in tasks]
         return f"{title}:\n" + "\n".join(formatted_tasks)
+    
+    # NEW: Helper to format facts for the prompt
+    def _format_facts(self, facts: List[Dict]) -> str:
+        if not facts: return "PERSONAL FACTS:\n- None"
+        formatted_facts = [f"- {fact['fact_key']}: {fact['fact_value']}" for fact in facts]
+        return "PERSONAL FACTS:\n" + "\n".join(formatted_facts)
 
     async def process_message(self, user_id: int, message: str) -> Dict:
         active_tasks = self.db.get_tasks(user_id)
         last_completed = self.db.get_tasks(user_id, completed=True, limit=1)
         history = self.db.get_recent_messages(user_id)
+        # MODIFIED: Get user facts to include in the prompt
+        user_facts = self.db.get_user_facts(user_id)
         
+        # MODIFIED: Updated system prompt with facts and new action
         system_prompt = f"""You are a hyper-intelligent, proactive personal assistant. Your primary function is to manage tasks and conversations with state-aware logic, reducing the user's mental load. You are concise and sound like a natural human.
 
 Current time: {datetime.now(self.timezone).isoformat()}
@@ -160,22 +187,24 @@ Current time: {datetime.now(self.timezone).isoformat()}
 **CONTEXTUAL BRIEFING (Source of Truth):**
 {self._format_tasks(active_tasks, "ACTIVE TASKS")}
 {self._format_tasks(last_completed, "LAST COMPLETED TASK")}
+{self._format_facts(user_facts)}
 
 **CORE DIRECTIVES (NON-NEGOTIABLE):**
-1.  **State Management is Key:** If a user's request modifies an existing task (e.g., "change that to 12pm"), you MUST use the `update_task` action. DO NOT create a duplicate task.
-2.  **Be Proactive & Infer:** If a task is created without a specific time (e.g., "on Monday"), you MUST ask for clarification. If a time is given without a date ("at 10"), assume it's for today or the soonest logical future time. Ask simple, direct questions (e.g., "10 AM or PM?").
-3.  **Use Full Context:** Your response MUST be informed by the conversation history AND the task lists.
-4.  **Prioritize Recent Actions:** When asked "what did I just finish?", your answer MUST be based ONLY on the 'LAST COMPLETED TASK'.
+1.  **State Management is Key:** If a user's request modifies an existing task (e.g., "change that to 12pm"), you MUST use the `update_task` action with the correct task ID. DO NOT create a duplicate.
+2.  **Remember Personal Details:** If the user tells you a personal fact (e.g., "my dog's name is Max"), you MUST use the `remember_fact` action to save it.
+3.  **Use Full Context:** Your response MUST be informed by conversation history, tasks, AND personal facts.
+4.  **Date/Time Formatting:** All `due_date` fields MUST be in UTC ISO 8601 format, ending with 'Z'. Example: "2025-10-27T14:30:00Z".
 5.  **JSON Output Only:** Your entire response must be a single, valid JSON object.
 
 **RESPONSE FORMAT (JSON ONLY):**
 {{
   "reply": "Your concise, intelligent, and natural response.",
   "actions": [
-    {{"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SS+01:00"}},
+    {{"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SSZ"}},
     {{"type": "update_task", "task_id": 123, "title": "(optional)", "due_date": "(optional)"}},
     {{"type": "delete_task", "task_id": 123}},
-    {{"type": "complete_task", "task_id": 123}}
+    {{"type": "complete_task", "task_id": 123}},
+    {{"type": "remember_fact", "key": "The fact's category, e.g. 'wife's name'", "value": "The fact itself, e.g. 'Jessica'"}}
   ]
 }}"""
 
@@ -197,7 +226,7 @@ Current time: {datetime.now(self.timezone).isoformat()}
                 content.setdefault('actions', [])
                 return content
         except Exception as e:
-            logger.error(f"AI processing error: {e}")
+            logger.error(f"AI processing error: {e}\nResponse: {response.text if 'response' in locals() else 'No response'}")
             return {"reply": "I'm having a bit of trouble right now. Please try again.", "actions": []}
 
 
@@ -263,7 +292,6 @@ class PersonalAssistantBot:
                 self.db.update_task(task_id, **update_data)
                 
                 if update_data.get('due_date'):
-                    # Fetch the full task details to get the title
                     all_tasks = self.db.get_tasks(user_id) + self.db.get_tasks(user_id, completed=True)
                     task = next((t for t in all_tasks if t['id'] == task_id), None)
                     if task: self.schedule_reminder(task_id, update_data['due_date'], task['title'], chat_id)
@@ -271,20 +299,38 @@ class PersonalAssistantBot:
                 self.db.complete_task(task_id)
             elif action_type == 'delete_task' and task_id:
                 self.db.delete_task(task_id)
+            # NEW: Handle the remember_fact action
+            elif action_type == 'remember_fact' and 'key' in action and 'value' in action:
+                self.db.add_user_fact(user_id, action['key'], action['value'])
+                logger.info(f"Remembered new fact for user {user_id}: {action['key']}")
+
         except Exception as e:
             logger.error(f"Action execution error ({action_type}): {e}\n{traceback.format_exc()}")
 
     def parse_due_date(self, due_str: Optional[str]) -> Optional[datetime]:
         if not due_str: return None
-        try: return datetime.fromisoformat(due_str.replace('Z', '+00:00'))
-        except: return None
+        try: 
+            return datetime.fromisoformat(due_str.replace('Z', '+00:00'))
+        except (ValueError, TypeError): 
+            logger.warning(f"Could not parse due_date string: {due_str}")
+            return None
     
     def schedule_reminder(self, task_id: int, due_date: datetime, title: str, chat_id: int):
-        aware_due = due_date if due_date.tzinfo else due_date.replace(tzinfo=self.user_timezone)
-        if aware_due > datetime.now(self.user_timezone):
-            self.scheduler.add_job(self.send_task_reminder, DateTrigger(run_date=aware_due),
-                                   args=[chat_id, title, task_id], id=f"task_{task_id}", replace_existing=True)
-            logger.info(f"Scheduled reminder for task {task_id} ('{title}') at {aware_due.strftime('%Y-%m-%d %H:%M:%S')}")
+        aware_due = due_date if due_date.tzinfo else self.user_timezone.localize(due_date)
+        now_aware = datetime.now(self.user_timezone)
+
+        if aware_due > now_aware:
+            job_id = f"task_{task_id}"
+            self.scheduler.add_job(
+                self.send_task_reminder, 
+                DateTrigger(run_date=aware_due),
+                args=[chat_id, title, task_id], 
+                id=job_id, 
+                replace_existing=True
+            )
+            logger.info(f"Scheduled reminder for task {task_id} ('{title}') at {aware_due.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        else:
+            logger.warning(f"Did not schedule reminder for task {task_id} as its due date {aware_due} is in the past.")
 
     async def send_task_reminder(self, chat_id: int, title: str, task_id: int):
         try:
@@ -297,25 +343,32 @@ class PersonalAssistantBot:
 
     async def handle_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message_reaction or not update.message_reaction.new_reaction: return
-        task_id = self.db.get_task_from_message(update.message_reaction.message_id)
-        if task_id and any(r.emoji in ['👍', '✅'] for r in update.message_reaction.new_reaction):
+        
+        message_id = update.message_reaction.message_id
+        chat_id = update.effective_chat.id
+        logger.info(f"Received reaction for message {message_id} in chat {chat_id}")
+
+        task_id = self.db.get_task_from_message(message_id)
+        if not task_id:
+            logger.warning(f"No associated task found for message {message_id}")
+            return
+
+        if any(r.emoji in ['👍', '✅'] for r in update.message_reaction.new_reaction):
+            logger.info(f"Completing task {task_id} due to user reaction.")
             self.db.complete_task(task_id)
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Done.")
+            await context.bot.send_message(chat_id=chat_id, text="✅ Done.")
 
     def run(self):
-        """Sets up and runs the bot with graceful shutdown."""
         self.app.post_init = self.post_init
-        
         logger.info(f"Starting Personal Assistant Bot at {datetime.now(self.user_timezone)}")
-        
-        # This will run the bot until a shutdown signal is received (e.g., Ctrl+C)
         self.app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     secrets = {key: os.environ.get(key) for key in ["TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY", "DATABASE_URL"]}
     if not all(secrets.values()):
-        logger.error(f"Missing environment variables! Required: {', '.join(secrets.keys())}")
+        missing = [key for key, value in secrets.items() if not value]
+        logger.error(f"Missing environment variables! Required: {', '.join(missing)}")
         exit(1)
     
     bot = PersonalAssistantBot(secrets["TELEGRAM_BOT_TOKEN"], secrets["GEMINI_API_KEY"])
@@ -325,7 +378,6 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot execution stopped manually.")
     finally:
-        if bot.scheduler.running:
+        if bot.scheduler and bot.scheduler.running:
             bot.scheduler.shutdown()
             logger.info("Scheduler shut down.")
-
