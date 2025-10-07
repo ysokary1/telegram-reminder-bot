@@ -198,6 +198,7 @@ class ConversationAI:
         history = self.db.get_recent_messages(user_id)
         user_facts = self.db.get_user_facts(user_id)
         
+        # <<< --- THIS IS THE CORRECTED SECTION --- >>>
         system_prompt = f"""You are a hyper-intelligent, proactive personal assistant. Your primary function is to manage tasks and conversations with state-aware logic, reducing the user's mental load. You are concise and sound like a natural human.
 
 Current time: {datetime.now(self.timezone).isoformat()}
@@ -209,11 +210,12 @@ Current time: {datetime.now(self.timezone).isoformat()}
 
 **CORE DIRECTIVES (NON-NEGOTIABLE):**
 1.  **State Management is Key:** If a user's request modifies an existing task (e.g., "change that to 12pm"), you MUST use the `update_task` action with the correct task ID. DO NOT create a duplicate.
-2.  **Remember Personal Details:** If the user tells you a personal fact (e.g., "my dog's name is Max"), you MUST use the `remember_fact` action to save it.
-3.  **Use Full Context:** Your response MUST be informed by conversation history, tasks, AND personal facts.
-4.  **Date/Time Formatting:** All `due_date` fields MUST be in UTC ISO 8601 format, ending with 'Z'. Example: "2025-10-27T14:30:00Z".
-5.  **JSON Output Only:** Your entire response must be a single, valid JSON object.
-6.  **Always Clarify Timing:** For every new task, you MUST ask for a due date unless the user explicitly says it's not needed (e.g., "add milk to my shopping list"). Ask simple, direct questions like, "When should I set that for?"
+2.  **Distinguish User Intent:** The conversation history contains messages from the 'user' and your own replies ('model'). You MUST only create, update, or delete tasks based on explicit instructions from the **'user'**. **Never interpret your own ('model') past confirmation messages as a new request.** For example, if the history shows a model message "Okay, I've set a reminder...", you must recognize that the task is already handled and not create it again.
+3.  **Remember Personal Details:** If the user tells you a personal fact (e.g., "my dog's name is Max"), you MUST use the `remember_fact` action to save it.
+4.  **Use Full Context:** Your response MUST be informed by conversation history, tasks, AND personal facts.
+5.  **Date/Time Formatting:** All `due_date` fields MUST be in UTC ISO 8601 format, ending with 'Z'. Example: "2025-10-27T14:30:00Z".
+6.  **JSON Output Only:** Your entire response must be a single, valid JSON object.
+7.  **Always Clarify Timing:** For every new task, you MUST ask for a due date unless the user explicitly says it's not needed (e.g., "add milk to my shopping list"). Ask simple, direct questions like, "When should I set that for?"
 
 **RESPONSE FORMAT (JSON ONLY):**
 {{
@@ -226,6 +228,7 @@ Current time: {datetime.now(self.timezone).isoformat()}
     {{"type": "remember_fact", "key": "The fact's category, e.g. 'wife's name'", "value": "The fact itself, e.g. 'Jessica'"}}
   ]
 }}"""
+        # <<< --- END OF CORRECTED SECTION --- >>>
 
         contents = [{"role": "model" if msg['role'] == 'assistant' else 'user', "parts": [{"text": msg['message']}]} for msg in history]
         contents.append({"role": "user", "parts": [{"text": message}]})
@@ -443,7 +446,7 @@ Today's tasks:
             new_due_date = datetime.now(self.user_timezone) + timedelta(minutes=5)
             self.db.update_task(task_id, due_date=new_due_date)
             self.schedule_reminder(task_id, new_due_date, task['title'], task['chat_id'])
-            await query.edit_message_text(text=f" snooze Snoozed for 5 minutes: {task['title']}")
+            await query.edit_message_text(text=f"Snoozed for 5 minutes: {task['title']}")
             logger.info(f"Snoozed task {task_id} for 5 minutes via button press.")
 
     async def handle_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
