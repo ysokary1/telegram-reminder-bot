@@ -47,9 +47,18 @@ class Database:
                         id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, chat_id BIGINT NOT NULL,
                         title TEXT NOT NULL, due_date TIMESTAMP WITH TIME ZONE,
                         completed INTEGER DEFAULT 0, completed_at TIMESTAMP WITH TIME ZONE,
-                        created_at TIMESTAMP WITH TIME ZONE NOT NULL, job_id TEXT
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL, job_id TEXT,
+                        recurrence_rule TEXT
                     )
                 ''')
+                
+                # Add recurrence_rule column if it doesn't exist
+                try:
+                    cursor.execute('ALTER TABLE tasks ADD COLUMN IF NOT EXISTS recurrence_rule TEXT')
+                    conn.commit()
+                except psycopg2.Error:
+                    conn.rollback()
+                
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS conversation_history (
                         id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, role TEXT NOT NULL,
@@ -119,11 +128,11 @@ class Database:
         """
         return self._execute_query(query, (user_id, start_of_day, end_of_day), fetch='all')
 
-    def add_task(self, user_id: int, chat_id: int, title: str, due_date: Optional[datetime] = None) -> int:
+    def add_task(self, user_id: int, chat_id: int, title: str, due_date: Optional[datetime] = None, recurrence_rule: Optional[str] = None) -> int:
         now = datetime.now(ZoneInfo('Europe/London'))
         result = self._execute_query(
-            'INSERT INTO tasks (user_id, chat_id, title, due_date, created_at) VALUES (%s, %s, %s, %s, %s) RETURNING id',
-            (user_id, chat_id, title, due_date, now), fetch='one'
+            'INSERT INTO tasks (user_id, chat_id, title, due_date, created_at, recurrence_rule) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id',
+            (user_id, chat_id, title, due_date, now, recurrence_rule), fetch='one'
         )
         return result['id']
 
@@ -180,11 +189,16 @@ class ConversationAI:
         self.api_key = api_key
         self.db = db
         self.timezone = timezone
-        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={self.api_key}"
+        # UPGRADED MODEL for better intelligence
+        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-thinking-exp-01-21:generateContent?key={self.api_key}"
 
     def _format_tasks(self, tasks: List[Dict], title: str) -> str:
         if not tasks: return f"{title}:\n- None"
-        formatted_tasks = [f"- ID {t['id']}: {t['title']} (Due: {t['due_date'].astimezone(self.timezone).strftime('%A at %I:%M %p (%d %b)') if t['due_date'] else 'Not scheduled'})" for t in tasks]
+        formatted_tasks = []
+        for t in tasks:
+            recurrence = f" [Recurring: {t['recurrence_rule']}]" if t.get('recurrence_rule') else ""
+            due_info = f"Due: {t['due_date'].astimezone(self.timezone).strftime('%A at %I:%M %p (%d %b)')}" if t['due_date'] else 'Not scheduled'
+            formatted_tasks.append(f"- ID {t['id']}: {t['title']} ({due_info}){recurrence}")
         return f"{title}:\n" + "\n".join(formatted_tasks)
     
     def _format_facts(self, facts: List[Dict]) -> str:
@@ -192,43 +206,95 @@ class ConversationAI:
         formatted_facts = [f"- {fact['fact_key']}: {fact['fact_value']}" for fact in facts]
         return "PERSONAL FACTS:\n" + "\n".join(formatted_facts)
 
-    async def process_message(self, user_id: int, message: str) -> Dict:
+    async def process_message(self, user_id: int, message: str, replied_task_id: Optional[int] = None) -> Dict:
         active_tasks = self.db.get_tasks(user_id)
         last_completed = self.db.get_tasks(user_id, completed=True, limit=1)
         history = self.db.get_recent_messages(user_id)
         user_facts = self.db.get_user_facts(user_id)
         
-        # <<< --- THIS IS THE CORRECTED SECTION --- >>>
-        system_prompt = f"""You are a hyper-intelligent, proactive personal assistant. Your primary function is to manage tasks and conversations with state-aware logic, reducing the user's mental load. You are concise and sound like a natural human.
+        replied_task_context = ""
+        if replied_task_id:
+            task = self.db.get_task_by_id(replied_task_id)
+            if task:
+                replied_task_context = f"\n\n**IMPORTANT: The user is replying to a specific message about task ID {replied_task_id} ('{task['title']}'). Any modifications they request should apply to THIS task.**"
+        
+        system_prompt = f"""You are an elite, ultra-intelligent personal assistant. You operate at the level of a world-class executive assistant combined with advanced AI reasoning. Your responses are sharp, efficient, and demonstrate deep understanding of context and user intent.
 
-Current time: {datetime.now(self.timezone).isoformat()}
+**USER'S TIMEZONE:** Europe/London (currently BST - British Summer Time, UTC+1)
+**Current time:** {datetime.now(self.timezone).strftime('%A, %B %d, %Y at %I:%M %p %Z')}
 
 **CONTEXTUAL BRIEFING (Source of Truth):**
 {self._format_tasks(active_tasks, "ACTIVE TASKS")}
 {self._format_tasks(last_completed, "LAST COMPLETED TASK")}
-{self._format_facts(user_facts)}
+{self._format_facts(user_facts)}{replied_task_context}
 
-**CORE DIRECTIVES (NON-NEGOTIABLE):**
-1.  **State Management is Key:** If a user's request modifies an existing task (e.g., "change that to 12pm"), you MUST use the `update_task` action with the correct task ID. DO NOT create a duplicate.
-2.  **Distinguish User Intent:** The conversation history contains messages from the 'user' and your own replies ('model'). You MUST only create, update, or delete tasks based on explicit instructions from the **'user'**. **Never interpret your own ('model') past confirmation messages as a new request.** For example, if the history shows a model message "Okay, I've set a reminder...", you must recognize that the task is already handled and not create it again.
-3.  **Remember Personal Details:** If the user tells you a personal fact (e.g., "my dog's name is Max"), you MUST use the `remember_fact` action to save it.
-4.  **Use Full Context:** Your response MUST be informed by conversation history, tasks, AND personal facts.
-5.  **Date/Time Formatting:** All `due_date` fields MUST be in UTC ISO 8601 format, ending with 'Z'. Example: "2025-10-27T14:30:00Z".
-6.  **JSON Output Only:** Your entire response must be a single, valid JSON object.
-7.  **Always Clarify Timing:** For every new task, you MUST ask for a due date unless the user explicitly says it's not needed (e.g., "add milk to my shopping list"). Ask simple, direct questions like, "When should I set that for?"
+**CORE INTELLIGENCE DIRECTIVES:**
+
+1. **CRITICAL TIMEZONE HANDLING:** 
+   - When the user says a time like "10am" or "3:30pm", they mean THEIR LOCAL TIME (Europe/London, currently BST).
+   - You MUST convert this to UTC for the due_date field.
+   - Example: User says "10am" → Convert to "09:00:00Z" (UTC)
+   - Example: User says "2:30pm" → Convert to "13:30:00Z" (UTC)
+   - Example: User says "tomorrow at 9am" → Calculate tomorrow's date, set time to 09:00 BST, convert to "08:00:00Z"
+
+2. **State Management Excellence:**
+   - If modifying an existing task, ALWAYS use `update_task` with the correct task_id. NEVER create duplicates.
+   - When the user replies to a message about a task, context will be provided above. Use that task_id.
+
+3. **Distinguish User Intent:** 
+   - Conversation history contains 'user' and 'model' messages.
+   - ONLY create/update/delete tasks based on explicit 'user' instructions.
+   - NEVER interpret your own past confirmations as new requests.
+
+4. **Recurring Tasks:**
+   - Support recurring tasks with patterns: "daily", "every Monday", "every weekday", "weekly", "monthly"
+   - Use `recurrence_rule` field to store the pattern
+   - Examples:
+     * "daily" → Daily at the same time
+     * "weekdays" → Monday-Friday
+     * "every Monday" → Weekly on Mondays
+     * "every Monday and Wednesday" → Specific weekdays
+
+5. **Proactive Intelligence:**
+   - Anticipate needs based on context
+   - Make intelligent inferences from incomplete information
+   - Offer suggestions when appropriate
+   - Remember and use personal facts to personalize responses
+
+6. **Remember Personal Details:** 
+   - Use `remember_fact` for any personal information shared
+   - Categories: preferences, relationships, work details, schedules, etc.
+
+7. **Date/Time Formatting:** 
+   - All `due_date` fields in UTC ISO 8601: "YYYY-MM-DDTHH:MM:SSZ"
+   - Calculate relative times (tomorrow, next week) accurately
+   - Handle ambiguous times intelligently (assume business hours unless specified)
+
+8. **Communication Style:**
+   - Be concise but not curt
+   - Sound natural and human
+   - Show personality while remaining professional
+   - Use appropriate context from facts and history
 
 **RESPONSE FORMAT (JSON ONLY):**
-{{
-  "reply": "Your concise, intelligent, and natural response.",
+{
+  "reply": "Your intelligent, context-aware response",
   "actions": [
-    {{"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SSZ"}},
-    {{"type": "update_task", "task_id": 123, "title": "(optional)", "due_date": "(optional)"}},
-    {{"type": "delete_task", "task_id": 123}},
-    {{"type": "complete_task", "task_id": 123}},
-    {{"type": "remember_fact", "key": "The fact's category, e.g. 'wife's name'", "value": "The fact itself, e.g. 'Jessica'"}}
+    {"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SSZ", "recurrence_rule": "(optional: daily/weekly/etc)"},
+    {"type": "update_task", "task_id": 123, "title": "(optional)", "due_date": "(optional YYYY-MM-DDTHH:MM:SSZ)", "recurrence_rule": "(optional)"},
+    {"type": "delete_task", "task_id": 123},
+    {"type": "complete_task", "task_id": 123},
+    {"type": "remember_fact", "key": "category", "value": "fact"}
   ]
-}}"""
-        # <<< --- END OF CORRECTED SECTION --- >>>
+}
+
+**EXAMPLE SCENARIOS:**
+- User: "Remind me at 3pm" → due_date should be "14:00:00Z" (3pm BST = 2pm UTC)
+- User: "Change to 10am" (replying to a task) → update_task with due_date "09:00:00Z"
+- User: "Team meeting every Monday at 10" → create_task with recurrence_rule "every Monday"
+- User: "Call mom daily at 7pm" → create_task with recurrence_rule "daily" and due_date "18:00:00Z"
+
+Be brilliant. Be proactive. Be indispensable."""
 
         contents = [{"role": "model" if msg['role'] == 'assistant' else 'user', "parts": [{"text": msg['message']}]} for msg in history]
         contents.append({"role": "user", "parts": [{"text": message}]})
@@ -236,7 +302,7 @@ Current time: {datetime.now(self.timezone).isoformat()}
         payload = {
             "contents": contents,
             "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "generationConfig": {"response_mime_type": "application/json", "temperature": 0.2}
+            "generationConfig": {"response_mime_type": "application/json", "temperature": 0.3}
         }
         
         try:
@@ -289,7 +355,7 @@ class PersonalAssistantBot:
             pending_tasks = self.db.get_tasks(user['user_id'], completed=False)
             for task in pending_tasks:
                 if task.get('due_date'):
-                    self.schedule_reminder(task['id'], task['due_date'], task['title'], task['chat_id'])
+                    self.schedule_reminder(task['id'], task['due_date'], task['title'], task['chat_id'], task.get('recurrence_rule'))
                     reloaded_count += 1
         logger.info(f"Reloaded {reloaded_count} pending reminders.")
 
@@ -312,8 +378,8 @@ class PersonalAssistantBot:
                 time_str = task['due_date'].astimezone(self.user_timezone).strftime('%I:%M %p')
                 task_list_str += f"- {task['title']} (Due: {time_str})\n"
 
-            briefing_prompt = f"""You are a world-class executive assistant. Your tone is friendly, professional, and slightly motivational.
-Summarize the following list of tasks for the user's morning briefing. Group them logically if possible (e.g., by time or project). Keep it concise.
+            briefing_prompt = f"""You are a world-class executive assistant. Your tone is friendly, professional, and motivational.
+Summarize the following tasks for the morning briefing. Group them logically by time or theme. Keep it concise but energizing.
 
 Today's tasks:
 {task_list_str}
@@ -339,59 +405,151 @@ Today's tasks:
         self.db.register_user(user.id, chat.id)
         self.db.add_message(user.id, "user", message)
         
+        # Check if user is replying to a specific message
+        replied_task_id = None
+        if update.message.reply_to_message:
+            replied_message_id = update.message.reply_to_message.message_id
+            replied_task_id = self.db.get_task_from_message(replied_message_id)
+            if replied_task_id:
+                logger.info(f"User is replying to message about task {replied_task_id}")
+        
         await context.bot.send_chat_action(chat_id=chat.id, action='typing')
         
-        result = await self.ai.process_message(user.id, message)
+        result = await self.ai.process_message(user.id, message, replied_task_id)
         reply = result.get('reply', 'Understood.')
         
         self.db.add_message(user.id, "assistant", reply)
-        await update.message.reply_text(reply)
+        sent_message = await update.message.reply_text(reply)
         
+        # Execute actions and track which task was discussed
+        task_id_mentioned = None
         for action in result.get('actions', []):
-            await self.execute_action(user.id, chat.id, action)
+            action_task_id = await self.execute_action(user.id, chat.id, action)
+            if action_task_id:
+                task_id_mentioned = action_task_id
+        
+        # Store mapping of this reply message to the task
+        if task_id_mentioned:
+            self.db.store_message_task_map(sent_message.message_id, task_id_mentioned)
 
-    async def execute_action(self, user_id: int, chat_id: int, action: Dict):
+    async def execute_action(self, user_id: int, chat_id: int, action: Dict) -> Optional[int]:
         action_type = action.get('type')
         task_id = action.get('task_id')
         try:
             if action_type == 'create_task':
                 due_date = self.parse_due_date(action.get('due_date'))
-                new_task_id = self.db.add_task(user_id, chat_id, action['title'], due_date)
-                if due_date: self.schedule_reminder(new_task_id, due_date, action['title'], chat_id)
+                recurrence = action.get('recurrence_rule')
+                new_task_id = self.db.add_task(user_id, chat_id, action['title'], due_date, recurrence)
+                if due_date: 
+                    self.schedule_reminder(new_task_id, due_date, action['title'], chat_id, recurrence)
+                return new_task_id
+                
             elif action_type == 'update_task' and task_id:
                 update_data = {k: v for k, v in action.items() if k not in ['type', 'task_id']}
                 if 'due_date' in update_data:
                     update_data['due_date'] = self.parse_due_date(update_data['due_date'])
                 self.db.update_task(task_id, **update_data)
                 
-                if update_data.get('due_date'):
-                    task = self.db.get_task_by_id(task_id)
-                    if task: self.schedule_reminder(task_id, update_data['due_date'], task['title'], chat_id)
+                task = self.db.get_task_by_id(task_id)
+                if task:
+                    # Reschedule with updated info
+                    new_due = update_data.get('due_date', task['due_date'])
+                    new_recurrence = update_data.get('recurrence_rule', task.get('recurrence_rule'))
+                    if new_due:
+                        self.schedule_reminder(task_id, new_due, task['title'], chat_id, new_recurrence)
+                return task_id
+                
             elif action_type == 'complete_task' and task_id:
-                self.db.complete_task(task_id)
+                task = self.db.get_task_by_id(task_id)
+                if task and task.get('recurrence_rule'):
+                    # Recurring task - reschedule instead of completing
+                    next_due = self.calculate_next_occurrence(task['due_date'], task['recurrence_rule'])
+                    if next_due:
+                        self.db.update_task(task_id, due_date=next_due)
+                        self.schedule_reminder(task_id, next_due, task['title'], chat_id, task['recurrence_rule'])
+                        logger.info(f"Rescheduled recurring task {task_id} to {next_due}")
+                else:
+                    self.db.complete_task(task_id)
+                return task_id
+                
             elif action_type == 'delete_task' and task_id:
                 self.db.delete_task(task_id)
+                return task_id
+                
             elif action_type == 'remember_fact' and 'key' in action and 'value' in action:
                 self.db.add_user_fact(user_id, action['key'], action['value'])
                 logger.info(f"Remembered new fact for user {user_id}: {action['key']}")
 
         except Exception as e:
             logger.error(f"Action execution error ({action_type}): {e}\n{traceback.format_exc()}")
+        
+        return None
+
+    def calculate_next_occurrence(self, current_due: datetime, recurrence_rule: str) -> Optional[datetime]:
+        """Calculate the next occurrence based on recurrence rule"""
+        if not current_due or not recurrence_rule:
+            return None
+            
+        rule_lower = recurrence_rule.lower()
+        now = datetime.now(self.user_timezone)
+        
+        # Ensure current_due is timezone aware
+        if not current_due.tzinfo:
+            current_due = current_due.replace(tzinfo=ZoneInfo('UTC'))
+        current_due = current_due.astimezone(self.user_timezone)
+        
+        try:
+            if rule_lower == "daily":
+                next_due = current_due + timedelta(days=1)
+                # If that's in the past, advance to tomorrow from now
+                while next_due <= now:
+                    next_due += timedelta(days=1)
+                return next_due
+                
+            elif rule_lower == "weekdays":
+                next_due = current_due + timedelta(days=1)
+                while next_due.weekday() >= 5 or next_due <= now:  # Skip weekends
+                    next_due += timedelta(days=1)
+                return next_due
+                
+            elif "every monday" in rule_lower:
+                days_ahead = (0 - current_due.weekday()) % 7
+                if days_ahead == 0:
+                    days_ahead = 7
+                next_due = current_due + timedelta(days=days_ahead)
+                while next_due <= now:
+                    next_due += timedelta(days=7)
+                return next_due
+                
+            elif rule_lower in ["weekly", "every week"]:
+                next_due = current_due + timedelta(days=7)
+                while next_due <= now:
+                    next_due += timedelta(days=7)
+                return next_due
+                
+            # Add more patterns as needed
+            
+        except Exception as e:
+            logger.error(f"Error calculating next occurrence: {e}")
+        
+        return None
 
     def parse_due_date(self, due_str: Optional[str]) -> Optional[datetime]:
         if not due_str: return None
         try: 
-            return datetime.fromisoformat(due_str.replace('Z', '+00:00'))
+            # Parse as UTC datetime
+            dt = datetime.fromisoformat(due_str.replace('Z', '+00:00'))
+            logger.info(f"Parsed due_date '{due_str}' as {dt.astimezone(self.user_timezone).strftime('%Y-%m-%d %I:%M %p %Z')}")
+            return dt
         except (ValueError, TypeError): 
             logger.warning(f"Could not parse due_date string: {due_str}")
             return None
     
-    def schedule_reminder(self, task_id: int, due_date: datetime, title: str, chat_id: int):
+    def schedule_reminder(self, task_id: int, due_date: datetime, title: str, chat_id: int, recurrence_rule: Optional[str] = None):
         if not due_date.tzinfo:
             due_date = due_date.replace(tzinfo=ZoneInfo('UTC'))
 
         aware_due = due_date.astimezone(self.user_timezone)
-        
         now_aware = datetime.now(self.user_timezone)
 
         if aware_due > now_aware:
@@ -399,15 +557,16 @@ Today's tasks:
             self.scheduler.add_job(
                 self.send_task_reminder, 
                 DateTrigger(run_date=aware_due),
-                args=[chat_id, title, task_id], 
+                args=[chat_id, title, task_id, recurrence_rule], 
                 id=job_id, 
                 replace_existing=True
             )
-            logger.info(f"Scheduled reminder for task {task_id} ('{title}') at {aware_due.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            recurrence_note = f" (Recurring: {recurrence_rule})" if recurrence_rule else ""
+            logger.info(f"Scheduled reminder for task {task_id} ('{title}') at {aware_due.strftime('%Y-%m-%d %I:%M %p %Z')}{recurrence_note}")
         else:
             logger.warning(f"Did not schedule reminder for task {task_id} as its due date {aware_due} is in the past.")
 
-    async def send_task_reminder(self, chat_id: int, title: str, task_id: int):
+    async def send_task_reminder(self, chat_id: int, title: str, task_id: int, recurrence_rule: Optional[str] = None):
         try:
             keyboard = [
                 [
@@ -417,11 +576,14 @@ Today's tasks:
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            message_text = f"⏰ Reminder: {title}"
+            recurrence_emoji = "🔄 " if recurrence_rule else ""
+            message_text = f"{recurrence_emoji}⏰ Reminder: {title}"
             sent_message = await self.app.bot.send_message(
                 chat_id=chat_id, text=message_text, reply_markup=reply_markup
             )
-            logger.info(f"Successfully sent reminder with buttons for task {task_id} to chat {chat_id}.")
+            # Store mapping for replies
+            self.db.store_message_task_map(sent_message.message_id, task_id)
+            logger.info(f"Successfully sent reminder for task {task_id} to chat {chat_id}.")
         except Exception as e:
             logger.error(f"Failed to send reminder for task {task_id}: {e}")
 
@@ -438,14 +600,24 @@ Today's tasks:
             return
 
         if action == "complete":
-            self.db.complete_task(task_id)
-            await query.edit_message_text(text=f"✅ Done: {task['title']}")
-            logger.info(f"Completed task {task_id} via button press.")
+            if task.get('recurrence_rule'):
+                # Recurring task - reschedule
+                next_due = self.calculate_next_occurrence(task['due_date'], task['recurrence_rule'])
+                if next_due:
+                    self.db.update_task(task_id, due_date=next_due)
+                    self.schedule_reminder(task_id, next_due, task['title'], task['chat_id'], task['recurrence_rule'])
+                    next_time = next_due.strftime('%I:%M %p on %A, %b %d')
+                    await query.edit_message_text(text=f"✅ Done! Rescheduled for {next_time}: {task['title']}")
+                    logger.info(f"Completed and rescheduled recurring task {task_id}")
+            else:
+                self.db.complete_task(task_id)
+                await query.edit_message_text(text=f"✅ Done: {task['title']}")
+                logger.info(f"Completed task {task_id} via button press.")
         
         elif action == "snooze":
             new_due_date = datetime.now(self.user_timezone) + timedelta(minutes=5)
             self.db.update_task(task_id, due_date=new_due_date)
-            self.schedule_reminder(task_id, new_due_date, task['title'], task['chat_id'])
+            self.schedule_reminder(task_id, new_due_date, task['title'], task['chat_id'], task.get('recurrence_rule'))
             await query.edit_message_text(text=f"Snoozed for 5 minutes: {task['title']}")
             logger.info(f"Snoozed task {task_id} for 5 minutes via button press.")
 
