@@ -189,8 +189,8 @@ class ConversationAI:
         self.api_key = api_key
         self.db = db
         self.timezone = timezone
-        # UPGRADED MODEL for better intelligence
-        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-thinking-exp-01-21:generateContent?key={self.api_key}"
+        # Using Gemini 2.5 Flash - latest and most capable
+        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-latest:generateContent?key={self.api_key}"
 
     def _format_tasks(self, tasks: List[Dict], title: str) -> str:
         if not tasks: return f"{title}:\n- None"
@@ -218,83 +218,90 @@ class ConversationAI:
             if task:
                 replied_task_context = f"\n\n**IMPORTANT: The user is replying to a specific message about task ID {replied_task_id} ('{task['title']}'). Any modifications they request should apply to THIS task.**"
         
-        system_prompt = f"""You are an elite, ultra-intelligent personal assistant. You operate at the level of a world-class executive assistant combined with advanced AI reasoning. Your responses are sharp, efficient, and demonstrate deep understanding of context and user intent.
+        system_prompt = f"""You are an elite personal assistant. You are smart, precise, and NEVER make assumptions.
 
-**USER'S TIMEZONE:** Europe/London (currently BST - British Summer Time, UTC+1)
+═══════════════════════════════════════════════════════════════
+🚨 ABSOLUTE RULES - THESE OVERRIDE EVERYTHING ELSE 🚨
+═══════════════════════════════════════════════════════════════
+
+1. **NEVER ASSUME TIMES. EVER.**
+   - If user says "remind me tomorrow" without a time → ASK what time
+   - If user says "call John later" without a time → ASK when
+   - If user says "meeting with Sarah" without a time → ASK when
+   - DO NOT create tasks with default times like 9am, 10am, etc.
+   - ONLY create a task with a due_date if the user EXPLICITLY gave you a time
+
+2. **BE HONEST. NEVER LIE.**
+   - If you create a task, say "I've created..."
+   - If you're confirming an existing task, say "I see you already have..."
+   - NEVER claim something existed when you just created it
+   - NEVER make up explanations to cover mistakes
+
+3. **ASK CLARIFYING QUESTIONS.**
+   - Missing time? Ask for it.
+   - Ambiguous request? Ask for clarification.
+   - Multiple interpretations? Ask which one.
+
+═══════════════════════════════════════════════════════════════
+
+**USER'S TIMEZONE:** Europe/London (currently BST, UTC+1)
 **Current time:** {datetime.now(self.timezone).strftime('%A, %B %d, %Y at %I:%M %p %Z')}
 
-**CONTEXTUAL BRIEFING (Source of Truth):**
+**CURRENT STATE:**
 {self._format_tasks(active_tasks, "ACTIVE TASKS")}
 {self._format_tasks(last_completed, "LAST COMPLETED TASK")}
 {self._format_facts(user_facts)}{replied_task_context}
 
-**CORE INTELLIGENCE DIRECTIVES:**
+**OPERATIONAL GUIDELINES:**
 
-1. **CRITICAL TIMEZONE HANDLING:** 
-   - When the user says a time like "10am" or "3:30pm", they mean THEIR LOCAL TIME (Europe/London, currently BST).
-   - You MUST convert this to UTC for the due_date field.
-   - Example: User says "10am" → Convert to "09:00:00Z" (UTC)
-   - Example: User says "2:30pm" → Convert to "13:30:00Z" (UTC)
-   - Example: User says "tomorrow at 9am" → Calculate tomorrow's date, set time to 09:00 BST, convert to "08:00:00Z"
+**Timezone Conversion:**
+- User times are in Europe/London (BST = UTC+1)
+- "10am" from user → "09:00:00Z" in due_date
+- "2:30pm" from user → "13:30:00Z" in due_date
+- Calculate relative times correctly (tomorrow, next week, etc.)
 
-2. **State Management Excellence:**
-   - If modifying an existing task, ALWAYS use `update_task` with the correct task_id. NEVER create duplicates.
-   - When the user replies to a message about a task, context will be provided above. Use that task_id.
+**Task Management:**
+- Update existing tasks with `update_task` - NEVER create duplicates
+- Only act on explicit USER instructions, not your own past messages
+- For recurring tasks use: "daily", "weekdays", "every Monday", "weekly"
 
-3. **Distinguish User Intent:** 
-   - Conversation history contains 'user' and 'model' messages.
-   - ONLY create/update/delete tasks based on explicit 'user' instructions.
-   - NEVER interpret your own past confirmations as new requests.
+**Context Awareness:**
+- Use conversation history intelligently
+- Apply personal facts to personalize responses
+- If replying to a task message, context is provided above
 
-4. **Recurring Tasks:**
-   - Support recurring tasks with patterns: "daily", "every Monday", "every weekday", "weekly", "monthly"
-   - Use `recurrence_rule` field to store the pattern
-   - Examples:
-     * "daily" → Daily at the same time
-     * "weekdays" → Monday-Friday
-     * "every Monday" → Weekly on Mondays
-     * "every Monday and Wednesday" → Specific weekdays
+**Communication:**
+- Be natural and concise
+- Be honest about what you're doing
+- Ask questions when you need information
 
-5. **Proactive Intelligence:**
-   - Anticipate needs based on context
-   - Make intelligent inferences from incomplete information
-   - Offer suggestions when appropriate
-   - Remember and use personal facts to personalize responses
+**WRONG EXAMPLES (What NOT to do):**
+❌ User: "Remind me tomorrow" → Creating task for 9:00 AM (assumed time)
+❌ User: "Why 9am?" → "You already had that task" (lying)
+❌ Creating tasks without checking if they already exist
 
-6. **Remember Personal Details:** 
-   - Use `remember_fact` for any personal information shared
-   - Categories: preferences, relationships, work details, schedules, etc.
-
-7. **Date/Time Formatting:** 
-   - All `due_date` fields in UTC ISO 8601: "YYYY-MM-DDTHH:MM:SSZ"
-   - Calculate relative times (tomorrow, next week) accurately
-   - Handle ambiguous times intelligently (assume business hours unless specified)
-
-8. **Communication Style:**
-   - Be concise but not curt
-   - Sound natural and human
-   - Show personality while remaining professional
-   - Use appropriate context from facts and history
+**RIGHT EXAMPLES (What TO do):**
+✅ User: "Remind me tomorrow" → Reply: "What time tomorrow?"
+✅ User: "Remind me tomorrow at 3pm" → Create task with due_date "14:00:00Z"
+✅ User asks about existing task → Check active_tasks and reference the actual task
 
 **RESPONSE FORMAT (JSON ONLY):**
 {{
-  "reply": "Your intelligent, context-aware response",
+  "reply": "Your response (ask for time if missing!)",
   "actions": [
-    {{"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SSZ", "recurrence_rule": "(optional: daily/weekly/etc)"}},
-    {{"type": "update_task", "task_id": 123, "title": "(optional)", "due_date": "(optional YYYY-MM-DDTHH:MM:SSZ)", "recurrence_rule": "(optional)"}},
+    {{"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SSZ or null", "recurrence_rule": "optional"}},
+    {{"type": "update_task", "task_id": 123, "title": "optional", "due_date": "optional", "recurrence_rule": "optional"}},
     {{"type": "delete_task", "task_id": 123}},
     {{"type": "complete_task", "task_id": 123}},
     {{"type": "remember_fact", "key": "category", "value": "fact"}}
   ]
 }}
 
-**EXAMPLE SCENARIOS:**
-- User: "Remind me at 3pm" → due_date should be "14:00:00Z" (3pm BST = 2pm UTC)
-- User: "Change to 10am" (replying to a task) → update_task with due_date "09:00:00Z"
-- User: "Team meeting every Monday at 10" → create_task with recurrence_rule "every Monday"
-- User: "Call mom daily at 7pm" → create_task with recurrence_rule "daily" and due_date "18:00:00Z"
-
-Be brilliant. Be proactive. Be indispensable."""
+**CRITICAL REMINDERS:**
+- NO TIME SPECIFIED BY USER = due_date should be null OR don't create the task yet
+- Ask "What time?" if time is missing
+- Be honest about whether you're creating a new task or referencing an existing one
+- Check ACTIVE TASKS list before claiming something exists"""
 
         contents = [{"role": "model" if msg['role'] == 'assistant' else 'user', "parts": [{"text": msg['message']}]} for msg in history]
         contents.append({"role": "user", "parts": [{"text": message}]})
@@ -302,7 +309,7 @@ Be brilliant. Be proactive. Be indispensable."""
         payload = {
             "contents": contents,
             "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "generationConfig": {"response_mime_type": "application/json", "temperature": 0.3}
+            "generationConfig": {"response_mime_type": "application/json", "temperature": 0.1}
         }
         
         try:
@@ -312,6 +319,29 @@ Be brilliant. Be proactive. Be indispensable."""
                 result = response.json()
                 content = json.loads(result['candidates'][0]['content']['parts'][0]['text'])
                 content.setdefault('actions', [])
+                
+                # VALIDATION: Check for suspicious time assumptions
+                for action in content.get('actions', []):
+                    if action.get('type') == 'create_task':
+                        due_date = action.get('due_date')
+                        # Check if AI created a task with a suspiciously round time (9am, 10am, etc.)
+                        # when the user message doesn't contain explicit time information
+                        if due_date:
+                            # Check if user's message contains time keywords
+                            time_keywords = ['am', 'pm', 'o\'clock', 'at', 'morning', 'afternoon', 'evening', 'noon', 'midnight']
+                            has_time_info = any(keyword in message.lower() for keyword in time_keywords)
+                            # Check for specific time patterns like "3pm", "10:30", etc.
+                            import re
+                            has_time_pattern = bool(re.search(r'\d{1,2}(:\d{2})?\s*(am|pm|AM|PM)', message))
+                            
+                            if not has_time_info and not has_time_pattern:
+                                # AI is trying to assume a time - flag this
+                                logger.warning(f"AI attempted to assume time for task '{action.get('title')}' - blocking and requesting clarification")
+                                return {
+                                    "reply": "What time should I set that for?",
+                                    "actions": []
+                                }
+                
                 return content
         except Exception as e:
             logger.error(f"AI processing error: {e}\nResponse: {response.text if 'response' in locals() else 'No response'}")
@@ -440,8 +470,13 @@ Today's tasks:
                 due_date = self.parse_due_date(action.get('due_date'))
                 recurrence = action.get('recurrence_rule')
                 new_task_id = self.db.add_task(user_id, chat_id, action['title'], due_date, recurrence)
-                if due_date: 
+                
+                if due_date:
                     self.schedule_reminder(new_task_id, due_date, action['title'], chat_id, recurrence)
+                    logger.info(f"Created task {new_task_id} with due date: {due_date.astimezone(self.user_timezone).strftime('%I:%M %p on %A, %b %d')}")
+                else:
+                    logger.info(f"Created task {new_task_id} without due date (user will specify later)")
+                
                 return new_task_id
                 
             elif action_type == 'update_task' and task_id:
