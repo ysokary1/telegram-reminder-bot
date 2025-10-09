@@ -277,16 +277,16 @@ class ConversationAI:
    - Use appropriate context from facts and history
 
 **RESPONSE FORMAT (JSON ONLY):**
-{
+{{
   "reply": "Your intelligent, context-aware response",
   "actions": [
-    {"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SSZ", "recurrence_rule": "(optional: daily/weekly/etc)"},
-    {"type": "update_task", "task_id": 123, "title": "(optional)", "due_date": "(optional YYYY-MM-DDTHH:MM:SSZ)", "recurrence_rule": "(optional)"},
-    {"type": "delete_task", "task_id": 123},
-    {"type": "complete_task", "task_id": 123},
-    {"type": "remember_fact", "key": "category", "value": "fact"}
+    {{"type": "create_task", "title": "...", "due_date": "YYYY-MM-DDTHH:MM:SSZ", "recurrence_rule": "(optional: daily/weekly/etc)"}},
+    {{"type": "update_task", "task_id": 123, "title": "(optional)", "due_date": "(optional YYYY-MM-DDTHH:MM:SSZ)", "recurrence_rule": "(optional)"}},
+    {{"type": "delete_task", "task_id": 123}},
+    {{"type": "complete_task", "task_id": 123}},
+    {{"type": "remember_fact", "key": "category", "value": "fact"}}
   ]
-}
+}}
 
 **EXAMPLE SCENARIOS:**
 - User: "Remind me at 3pm" → due_date should be "14:00:00Z" (3pm BST = 2pm UTC)
