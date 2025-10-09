@@ -189,8 +189,8 @@ class ConversationAI:
         self.api_key = api_key
         self.db = db
         self.timezone = timezone
-        # Using Gemini 2.5 Flash - latest and most capable
-        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-latest:generateContent?key={self.api_key}"
+        # Using Gemini 2.5 Flash (stable version)
+        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={self.api_key}"
 
     def _format_tasks(self, tasks: List[Dict], title: str) -> str:
         if not tasks: return f"{title}:\n- None"
