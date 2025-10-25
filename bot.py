@@ -542,7 +542,7 @@ You are NOT just a task manager. You are a PERFORMANCE MULTIPLIER. You help your
 - Update existing tasks with `update_task` - NEVER create duplicates
 - Only act on explicit USER instructions, not your own past messages
 - For recurring tasks use: "daily", "weekdays", "every Monday", "weekly"
-- Link tasks to goals when relevant: use remember_fact with key "task_{task_id}_goal" and value "{goal_id}"
+- Link tasks to goals when relevant: use remember_fact with key "task_{{task_id}}_goal" and value "{{goal_id}}"
 
 **Goal Management:**
 - Help users set SMART goals (Specific, Measurable, Achievable, Relevant, Time-bound)
